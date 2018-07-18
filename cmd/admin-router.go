@@ -67,7 +67,7 @@ func registerAdminRouter(router *mux.Router) {
 	/// Config operations
 
 	// Update credentials
-	adminV1Router.Methods(http.MethodPut).Path("/config/credential").HandlerFunc(httpTraceHdrs(adminAPI.UpdateCredentialsHandler))
+	adminV1Router.Methods(http.MethodPut).Path("/config/credential").HandlerFunc(httpTraceHdrs(adminAPI.UpdateAdminCredentialsHandler))
 	// Get config
 	adminV1Router.Methods(http.MethodGet).Path("/config").HandlerFunc(httpTraceHdrs(adminAPI.GetConfigHandler))
 	// Set config
@@ -77,4 +77,13 @@ func registerAdminRouter(router *mux.Router) {
 	adminV1Router.Methods(http.MethodGet).Path("/config-keys").HandlerFunc(httpTraceHdrs(adminAPI.GetConfigKeysHandler))
 	// Set config keys/values
 	adminV1Router.Methods(http.MethodPut).Path("/config-keys").HandlerFunc(httpTraceHdrs(adminAPI.SetConfigKeysHandler))
+
+	// Add user IAM
+	adminV1Router.Methods(http.MethodPut).Path("/add-user").HandlerFunc(httpTraceHdrs(adminAPI.AddUser))
+	adminV1Router.Methods(http.MethodPut).Path("/add-user-policy").HandlerFunc(httpTraceHdrs(adminAPI.AddUserPolicy))
+
+	// Remove user IAM
+	adminV1Router.Methods(http.MethodDelete).Path("/remove-user").HandlerFunc(httpTraceHdrs(adminAPI.RemoveUser))
+	adminV1Router.Methods(http.MethodDelete).Path("/remove-user-policy").HandlerFunc(httpTraceHdrs(adminAPI.RemoveUserPolicy))
+
 }

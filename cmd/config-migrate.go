@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
@@ -29,6 +30,8 @@ import (
 	"github.com/minio/minio/pkg/dns"
 	"github.com/minio/minio/pkg/event"
 	"github.com/minio/minio/pkg/event/target"
+	"github.com/minio/minio/pkg/iam/policy"
+	"github.com/minio/minio/pkg/iam/validator"
 	xnet "github.com/minio/minio/pkg/net"
 	"github.com/minio/minio/pkg/quick"
 )
@@ -2414,23 +2417,68 @@ func migrateMinioSysConfig(objAPI ObjectLayer) error {
 	if err := migrateV27ToV28MinioSys(objAPI); err != nil {
 		return err
 	}
-	return migrateV28ToV29MinioSys(objAPI)
+	if err := migrateV28ToV29MinioSys(objAPI); err != nil {
+		return err
+	}
+	return migrateV29ToV30MinioSys(objAPI)
 }
 
-func migrateV28ToV29MinioSys(objAPI ObjectLayer) error {
+func migrateV27ToV28MinioSys(objAPI ObjectLayer) error {
 	configFile := path.Join(minioConfigPrefix, minioConfigFile)
-	srvConfig, err := readServerConfig(context.Background(), objAPI)
+	data, err := readConfig(context.Background(), objAPI, configFile)
 	if err == errConfigNotFound {
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("Unable to load config file. %v", err)
 	}
-	if srvConfig.Version != "28" {
+
+	cfg := &serverConfigV28{}
+	if err = json.Unmarshal(data, cfg); err != nil {
+		return err
+	}
+	if cfg.Version != "27" {
 		return nil
 	}
 
-	srvConfig.Version = "29"
-	if err = saveServerConfig(context.Background(), objAPI, srvConfig); err != nil {
+	cfg.Version = "28"
+	cfg.KMS = crypto.KMSConfig{}
+
+	data, err = json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+
+	if err = saveConfig(context.Background(), objAPI, configFile, data); err != nil {
+		return fmt.Errorf("Failed to migrate config from ‘27’ to ‘28’. %v", err)
+	}
+
+	logger.Info(configMigrateMSGTemplate, configFile, "27", "28")
+	return nil
+}
+
+func migrateV28ToV29MinioSys(objAPI ObjectLayer) error {
+	configFile := path.Join(minioConfigPrefix, minioConfigFile)
+	data, err := readConfig(context.Background(), objAPI, configFile)
+	if err == errConfigNotFound {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("Unable to load config file. %v", err)
+	}
+	cfg := &serverConfigV29{}
+	if err = json.Unmarshal(data, cfg); err != nil {
+		return err
+	}
+	if cfg.Version != "28" {
+		return nil
+	}
+
+	cfg.Version = "29"
+	data, err = json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+
+	if err = saveConfig(context.Background(), objAPI, configFile, data); err != nil {
 		return fmt.Errorf("Failed to migrate config from ‘28’ to ‘29’. %v", err)
 	}
 
@@ -2438,24 +2486,40 @@ func migrateV28ToV29MinioSys(objAPI ObjectLayer) error {
 	return nil
 }
 
-func migrateV27ToV28MinioSys(objAPI ObjectLayer) error {
+func migrateV29ToV30MinioSys(objAPI ObjectLayer) error {
 	configFile := path.Join(minioConfigPrefix, minioConfigFile)
-	srvConfig, err := readServerConfig(context.Background(), objAPI)
+	data, err := readConfig(context.Background(), objAPI, configFile)
 	if err == errConfigNotFound {
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("Unable to load config file. %v", err)
 	}
-	if srvConfig.Version != "27" {
+	cfg := &serverConfigV30{}
+	if err = json.Unmarshal(data, cfg); err != nil {
+		return err
+	}
+	if cfg.Version != "29" {
 		return nil
 	}
 
-	srvConfig.Version = "28"
-	srvConfig.KMS = crypto.KMSConfig{}
-	if err = saveServerConfig(context.Background(), objAPI, srvConfig); err != nil {
-		return fmt.Errorf("Failed to migrate config from ‘27’ to ‘28’. %v", err)
+	cfg.Version = "30"
+	cfg.OpenID.JWKS = validator.JWKSArgs{
+		URL: &xnet.URL{},
+	}
+	cfg.Policy.OPA = iampolicy.OpaArgs{
+		URL:       &xnet.URL{},
+		AuthToken: "",
 	}
 
-	logger.Info(configMigrateMSGTemplate, configFile, "27", "28")
+	data, err = json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+
+	if err = saveConfig(context.Background(), objAPI, configFile, data); err != nil {
+		return fmt.Errorf("Failed to migrate config from ‘29’ to ‘30’. %v", err)
+	}
+
+	logger.Info(configMigrateMSGTemplate, configFile, "29", "30")
 	return nil
 }

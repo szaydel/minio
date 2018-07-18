@@ -37,7 +37,7 @@ import (
 
 var (
 	configJSON = []byte(`{
-	"version": "29",
+	"version": "30",
 	"credential": {
 		"accessKey": "minio",
 		"secretKey": "minio123"
@@ -480,6 +480,8 @@ func getServiceCmdRequest(cmd cmdType, cred auth.Credentials, body []byte) (*htt
 
 	// Set body
 	req.Body = ioutil.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+
 	// Set sha-sum header
 	req.Header.Set("X-Amz-Content-Sha256", getSHA256Hash(body))
 
@@ -601,7 +603,7 @@ func TestServiceSetCreds(t *testing.T) {
 			t.Fatalf("JSONify err: %v", err)
 		}
 
-		ebody, err := madmin.EncryptServerConfigData(credentials.SecretKey, body)
+		ebody, err := madmin.EncryptData(credentials.SecretKey, body)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -708,7 +710,7 @@ func TestSetConfigHandler(t *testing.T) {
 	queryVal.Set("config", "")
 
 	password := globalServerConfig.GetCredential().SecretKey
-	econfigJSON, err := madmin.EncryptServerConfigData(password, configJSON)
+	econfigJSON, err := madmin.EncryptData(password, configJSON)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -728,7 +730,7 @@ func TestSetConfigHandler(t *testing.T) {
 	// Check that a very large config file returns an error.
 	{
 		// Make a large enough config string
-		invalidCfg := []byte(strings.Repeat("A", maxConfigJSONSize+1))
+		invalidCfg := []byte(strings.Repeat("A", maxEConfigJSONSize+1))
 		req, err := buildAdminRequest(queryVal, http.MethodPut, "/config",
 			int64(len(invalidCfg)), bytes.NewReader(invalidCfg))
 		if err != nil {
@@ -758,7 +760,7 @@ func TestSetConfigHandler(t *testing.T) {
 		adminTestBed.router.ServeHTTP(rec, req)
 		respBody := string(rec.Body.Bytes())
 		if rec.Code != http.StatusBadRequest ||
-			!strings.Contains(respBody, "JSON configuration provided has objects with duplicate keys") {
+			!strings.Contains(respBody, "JSON configuration provided is of incorrect format") {
 			t.Errorf("Got unexpected response code or body %d - %s", rec.Code, respBody)
 		}
 	}

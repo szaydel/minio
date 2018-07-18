@@ -22,6 +22,8 @@ import (
 	"github.com/minio/minio/cmd/crypto"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/event/target"
+	"github.com/minio/minio/pkg/iam/policy"
+	"github.com/minio/minio/pkg/iam/validator"
 	"github.com/minio/minio/pkg/quick"
 )
 
@@ -780,4 +782,45 @@ type serverConfigV29 struct {
 
 	// Logger configuration
 	Logger loggerConfig `json:"logger"`
+}
+
+// serverConfigV30 is just like version '29', with OPA and OpenID configuration.
+type serverConfigV30 struct {
+	quick.Config `json:"-"` // ignore interfaces
+
+	Version string `json:"version"`
+
+	// S3 API configuration.
+	Credential auth.Credentials `json:"credential"`
+	Region     string           `json:"region"`
+	Worm       BoolFlag         `json:"worm"`
+
+	// Storage class configuration
+	StorageClass storageClassConfig `json:"storageclass"`
+
+	// Cache configuration
+	Cache CacheConfig `json:"cache"`
+
+	// KMS configuration
+	KMS crypto.KMSConfig `json:"kms"`
+
+	// Notification queue configuration.
+	Notify notifier `json:"notify"`
+
+	// Logger configuration
+	Logger loggerConfig `json:"logger"`
+
+	// OpenID configuration
+	OpenID struct {
+		// JWKS validator config.
+		JWKS validator.JWKSArgs `json:"jwks"`
+	} `json:"openid"`
+
+	// External policy enforcements.
+	Policy struct {
+		// OPA configuration.
+		OPA iampolicy.OpaArgs `json:"opa"`
+
+		// Add new external policy enforcements here.
+	} `json:"policy"`
 }

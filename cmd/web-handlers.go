@@ -43,6 +43,7 @@ import (
 	"github.com/minio/minio/pkg/dns"
 	"github.com/minio/minio/pkg/event"
 	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/iam/policy"
 	"github.com/minio/minio/pkg/ioutil"
 	"github.com/minio/minio/pkg/policy"
 )
@@ -232,10 +233,11 @@ func (web *webAPIHandlers) ListBuckets(r *http.Request, args *WebGenericArgs, re
 	if web.CacheAPI() != nil {
 		listBuckets = web.CacheAPI().ListBuckets
 	}
-	authErr := webRequestAuthenticate(r)
-	if authErr != nil {
+
+	if _, authErr := webRequestAuthenticate(r); authErr != nil {
 		return toJSONError(authErr)
 	}
+
 	// If etcd, dns federation configured list buckets from etcd.
 	if globalDNSConfig != nil {
 		dnsBuckets, err := globalDNSConfig.List()
@@ -301,32 +303,66 @@ func (web *webAPIHandlers) ListObjects(r *http.Request, args *ListObjectsArgs, r
 	if objectAPI == nil {
 		return toJSONError(errServerNotInitialized)
 	}
+
 	listObjects := objectAPI.ListObjects
 	if web.CacheAPI() != nil {
 		listObjects = web.CacheAPI().ListObjects
 	}
 
-	// Check if anonymous (non-owner) has access to download objects.
-	readable := globalPolicySys.IsAllowed(policy.Args{
-		Action:          policy.GetObjectAction,
-		BucketName:      args.BucketName,
-		ConditionValues: getConditionValues(r, ""),
-		IsOwner:         false,
-		ObjectName:      args.Prefix + "/",
-	})
-	// Check if anonymous (non-owner) has access to upload objects.
-	writable := globalPolicySys.IsAllowed(policy.Args{
-		Action:          policy.PutObjectAction,
-		BucketName:      args.BucketName,
-		ConditionValues: getConditionValues(r, ""),
-		IsOwner:         false,
-		ObjectName:      args.Prefix + "/",
-	})
+	claims, authErr := webRequestAuthenticate(r)
+	if authErr != nil {
+		if authErr == errNoAuthToken {
+			// Check if anonymous (non-owner) has access to download objects.
+			readable := globalPolicySys.IsAllowed(policy.Args{
+				Action:          policy.GetObjectAction,
+				BucketName:      args.BucketName,
+				ConditionValues: getConditionValues(r, ""),
+				IsOwner:         false,
+				ObjectName:      args.Prefix + "/",
+			})
 
-	if authErr := webRequestAuthenticate(r); authErr != nil {
-		if authErr == errAuthentication {
+			// Check if anonymous (non-owner) has access to upload objects.
+			writable := globalPolicySys.IsAllowed(policy.Args{
+				Action:          policy.PutObjectAction,
+				BucketName:      args.BucketName,
+				ConditionValues: getConditionValues(r, ""),
+				IsOwner:         false,
+				ObjectName:      args.Prefix + "/",
+			})
+
+			reply.Writable = writable
+			if !readable {
+				// Error out if anonymous user (non-owner) has no access to download or upload objects
+				if !writable {
+					return errAuthentication
+				}
+				// return empty object list if access is write only
+				return nil
+			}
+		} else {
 			return toJSONError(authErr)
 		}
+	}
+
+	// For authenticated users apply IAM policy.
+	if authErr == nil {
+		readable := globalIAMSys.IsAllowed(iampolicy.Args{
+			AccountName:     claims.Subject,
+			Action:          iampolicy.Action(policy.GetObjectAction),
+			BucketName:      args.BucketName,
+			ConditionValues: getConditionValues(r, ""),
+			IsOwner:         claims.Subject == globalServerConfig.GetCredential().AccessKey,
+			ObjectName:      args.Prefix + "/",
+		})
+
+		writable := globalIAMSys.IsAllowed(iampolicy.Args{
+			AccountName:     claims.Subject,
+			Action:          iampolicy.Action(policy.PutObjectAction),
+			BucketName:      args.BucketName,
+			ConditionValues: getConditionValues(r, ""),
+			IsOwner:         claims.Subject == globalServerConfig.GetCredential().AccessKey,
+			ObjectName:      args.Prefix + "/",
+		})
 
 		reply.Writable = writable
 		if !readable {
@@ -337,7 +373,6 @@ func (web *webAPIHandlers) ListObjects(r *http.Request, args *ListObjectsArgs, r
 			// return empty object list if access is write only
 			return nil
 		}
-
 	}
 
 	lo, err := listObjects(context.Background(), args.BucketName, args.Prefix, args.Marker, slashSeparator, 1000)
@@ -615,18 +650,34 @@ func (web *webAPIHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 	bucket := vars["bucket"]
 	object := vars["object"]
 
-	if authErr := webRequestAuthenticate(r); authErr != nil {
-		if authErr == errAuthentication {
-			writeWebErrorResponse(w, errAuthentication)
+	claims, authErr := webRequestAuthenticate(r)
+	if authErr != nil {
+		if authErr == errNoAuthToken {
+			// Check if anonymous (non-owner) has access to upload objects.
+			if !globalPolicySys.IsAllowed(policy.Args{
+				Action:          policy.PutObjectAction,
+				BucketName:      bucket,
+				ConditionValues: getConditionValues(r, ""),
+				IsOwner:         false,
+				ObjectName:      object,
+			}) {
+				writeWebErrorResponse(w, errAuthentication)
+				return
+			}
+		} else {
+			writeWebErrorResponse(w, authErr)
 			return
 		}
+	}
 
-		// Check if anonymous (non-owner) has access to upload objects.
-		if !globalPolicySys.IsAllowed(policy.Args{
-			Action:          policy.PutObjectAction,
+	// For authenticated users apply IAM policy.
+	if authErr == nil {
+		if !globalIAMSys.IsAllowed(iampolicy.Args{
+			AccountName:     claims.Subject,
+			Action:          iampolicy.Action(policy.PutObjectAction),
 			BucketName:      bucket,
 			ConditionValues: getConditionValues(r, ""),
-			IsOwner:         false,
+			IsOwner:         claims.Subject == globalServerConfig.GetCredential().AccessKey,
 			ObjectName:      object,
 		}) {
 			writeWebErrorResponse(w, errAuthentication)
@@ -690,13 +741,34 @@ func (web *webAPIHandlers) Download(w http.ResponseWriter, r *http.Request) {
 	object := vars["object"]
 	token := r.URL.Query().Get("token")
 
-	if !isAuthTokenValid(token) {
-		// Check if anonymous (non-owner) has access to download objects.
-		if !globalPolicySys.IsAllowed(policy.Args{
-			Action:          policy.GetObjectAction,
+	claims, authErr := webTokenAthenticate(token)
+	if authErr != nil {
+		if authErr == errNoAuthToken {
+			// Check if anonymous (non-owner) has access to download objects.
+			if !globalPolicySys.IsAllowed(policy.Args{
+				Action:          policy.GetObjectAction,
+				BucketName:      bucket,
+				ConditionValues: getConditionValues(r, ""),
+				IsOwner:         false,
+				ObjectName:      object,
+			}) {
+				writeWebErrorResponse(w, errAuthentication)
+				return
+			}
+		} else {
+			writeWebErrorResponse(w, authErr)
+			return
+		}
+	}
+
+	// For authenticated users apply IAM policy.
+	if authErr == nil {
+		if !globalIAMSys.IsAllowed(iampolicy.Args{
+			AccountName:     claims.Subject,
+			Action:          iampolicy.Action(policy.GetObjectAction),
 			BucketName:      bucket,
 			ConditionValues: getConditionValues(r, ""),
-			IsOwner:         false,
+			IsOwner:         claims.Subject == globalServerConfig.GetCredential().AccessKey,
 			ObjectName:      object,
 		}) {
 			writeWebErrorResponse(w, errAuthentication)
@@ -776,14 +848,7 @@ func (web *webAPIHandlers) DownloadZip(w http.ResponseWriter, r *http.Request) {
 		writeWebErrorResponse(w, errServerNotInitialized)
 		return
 	}
-	getObject := objectAPI.GetObject
-	if web.CacheAPI() != nil {
-		getObject = web.CacheAPI().GetObject
-	}
-	listObjects := objectAPI.ListObjects
-	if web.CacheAPI() != nil {
-		listObjects = web.CacheAPI().ListObjects
-	}
+
 	// Auth is done after reading the body to accommodate for anonymous requests
 	// when bucket policy is enabled.
 	var args DownloadZipArgs
@@ -795,14 +860,37 @@ func (web *webAPIHandlers) DownloadZip(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := r.URL.Query().Get("token")
-	if !isAuthTokenValid(token) {
+	claims, authErr := webTokenAthenticate(token)
+	if authErr != nil {
+		if authErr == errNoAuthToken {
+			for _, object := range args.Objects {
+				// Check if anonymous (non-owner) has access to download objects.
+				if !globalPolicySys.IsAllowed(policy.Args{
+					Action:          policy.GetObjectAction,
+					BucketName:      args.BucketName,
+					ConditionValues: getConditionValues(r, ""),
+					IsOwner:         false,
+					ObjectName:      pathJoin(args.Prefix, object),
+				}) {
+					writeWebErrorResponse(w, errAuthentication)
+					return
+				}
+			}
+		} else {
+			writeWebErrorResponse(w, authErr)
+			return
+		}
+	}
+
+	// For authenticated users apply IAM policy.
+	if authErr == nil {
 		for _, object := range args.Objects {
-			// Check if anonymous (non-owner) has access to download objects.
-			if !globalPolicySys.IsAllowed(policy.Args{
-				Action:          policy.GetObjectAction,
+			if !globalIAMSys.IsAllowed(iampolicy.Args{
+				AccountName:     claims.Subject,
+				Action:          iampolicy.Action(policy.GetObjectAction),
 				BucketName:      args.BucketName,
 				ConditionValues: getConditionValues(r, ""),
-				IsOwner:         false,
+				IsOwner:         claims.Subject == globalServerConfig.GetCredential().AccessKey,
 				ObjectName:      pathJoin(args.Prefix, object),
 			}) {
 				writeWebErrorResponse(w, errAuthentication)
@@ -811,8 +899,18 @@ func (web *webAPIHandlers) DownloadZip(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	getObject := objectAPI.GetObject
+	if web.CacheAPI() != nil {
+		getObject = web.CacheAPI().GetObject
+	}
+	listObjects := objectAPI.ListObjects
+	if web.CacheAPI() != nil {
+		listObjects = web.CacheAPI().ListObjects
+	}
+
 	archive := zip.NewWriter(w)
 	defer archive.Close()
+
 	getObjectInfo := objectAPI.GetObjectInfo
 	if web.CacheAPI() != nil {
 		getObjectInfo = web.CacheAPI().GetObjectInfo
