@@ -132,6 +132,11 @@ The replication configuration can now be added to the source bucket by applying 
       "Destination": {
         "Bucket": "arn:aws:s3:::destbucket",
         "StorageClass": "STANDARD"
+      },
+      "SourceSelectionCriteria": {
+        "ReplicaModifications": {
+          "Status": "Enabled"
+        }
       }
     }
   ]
@@ -150,6 +155,19 @@ To perform bi-directional replication, repeat the above process on the target si
 
 ![head](https://raw.githubusercontent.com/minio/minio/master/docs/bucket/replication/HEAD_bucket_replication.png)
 
+## Replica Modification sync
+If bi-directional replication is set up between two clusters, any metadata update on the REPLICA object is by default reflected back in the source object when `ReplicaModifications` status in the `SourceSelectionCriteria` is `Enabled`. In MinIO, this is enabled by default. If a metadata update is performed on the "REPLICA" object, its `X-Amz-Replication-Status` will change from `PENDING` to `COMPLETE` or `FAILED`, and the source object version will show `X-Amz-Replication-Status` of `REPLICA` once the replication operation is complete.
+
+The replication configuration in use on a bucket can be viewed using the `mc replicate export alias/bucket` command.
+
+To disable replica metadata modification syncing, use `mc replicate edit` with the --replicate flag.
+```
+$ mc replicate edit alias/bucket --id xyz.id --replicate "delete,delete-marker"
+```
+To re-enable replica metadata modification syncing,
+```
+$ mc replicate edit alias/bucket --id xyz.id --replicate "delete,delete-marker,replica-metadata-sync"
+```
 ## MinIO Extension
 ### Replicating Deletes
 
@@ -184,7 +202,22 @@ remote replication target using the `mc admin bucket remote add` command
  mc admin bucket remote add myminio/srcbucket https://accessKey:secretKey@replica-endpoint:9000/destbucket --service replication --region us-east-1 --sync --healthcheck-seconds 100
 ```
 
+### Existing object replication
+Existing object replication as detailed [here](https://aws.amazon.com/blogs/storage/replicating-existing-objects-between-s3-buckets/) can be enabled by passing `existing-objects` as a value to `--replicate` flag while adding or editing a replication rule.
+
+Once existing object replication is enabled, all objects or object prefixes that satisfy the replication rules and were created prior to adding replication configuration OR while replication rules were disabled will be synced to the target cluster. Depending on the number of previously existing objects, the existing objects that are now eligible to be replicated will eventually be synced to the target cluster as the scanner schedules them. This may be slower depending on the load on the cluster, latency and size of the namespace.
+
+Note that existing object replication requires that the objects being replicated were created while versioning was enabled. Objects with null version (i.e. those created when versioning is not enabled or versioning is suspended) will not be replicated.
+
+In the rare event that target DR site is entirely lost and previously replicated objects to the DR cluster need to be re-replicated, `mc replicate resync alias/bucket` can be used to initiate a reset. This would initiate a re-sync between the two clusters on a lower priority as the scanner picks up these objects to re-sync.
+
+This is an expensive operation and should be initiated only once - progress of the syncing can be monitored by looking at Prometheus metrics. If object version has been re-replicated, `mc stat --vid --debug` on this version shows an additional header `X-Minio-Replication-Reset-Status` with the replication timestamp and ResetID generated at the time of issuing the `mc replicate resync` command.
+
+Note that ExistingObjectReplication needs to be enabled in the config via `mc replicate [add|edit]` by passing `existing-objects` as one of the values to `--replicate` flag. Only those objects meeting replication rules and having existing object replication enabled will be re-synced.
+
+Multi site replication is currently not supported.
+
 ## Explore Further
-- [MinIO Bucket Replication Design](https://raw.githubusercontent.com/minio/minio/master/docs/bucket/replication/DESIGN.md)
+- [MinIO Bucket Replication Design](https://github.com/minio/minio/blob/master/docs/bucket/replication/DESIGN.md)
 - [MinIO Bucket Versioning Implementation](https://docs.minio.io/docs/minio-bucket-versioning-guide.html)
 - [MinIO Client Quickstart Guide](https://docs.minio.io/docs/minio-client-quickstart-guide.html)

@@ -1,24 +1,26 @@
-/*
- * MinIO Cloud Storage, (C) 2018-2019 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -31,15 +33,15 @@ import (
 	"github.com/dchest/siphash"
 	"github.com/dustin/go-humanize"
 	"github.com/google/uuid"
+	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio-go/v7/pkg/tags"
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/bpool"
-	"github.com/minio/minio/pkg/console"
-	"github.com/minio/minio/pkg/dsync"
-	"github.com/minio/minio/pkg/env"
-	"github.com/minio/minio/pkg/madmin"
-	"github.com/minio/minio/pkg/sync/errgroup"
+	"github.com/minio/minio/internal/bpool"
+	"github.com/minio/minio/internal/dsync"
+	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/sync/errgroup"
+	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/env"
 )
 
 // setsDsyncLockers is encapsulated type for Close()
@@ -94,20 +96,28 @@ type erasureSets struct {
 
 	disksStorageInfoCache timedValue
 
-	mrfMU         sync.Mutex
-	mrfOperations map[healSource]int
+	mrfMU                  sync.Mutex
+	mrfOperations          map[healSource]int
+	lastConnectDisksOpTime time.Time
 }
 
-func isEndpointConnected(diskMap map[string]StorageAPI, endpoint string) bool {
+// Return false if endpoint is not connected or has been reconnected after last check
+func isEndpointConnectionStable(diskMap map[Endpoint]StorageAPI, endpoint Endpoint, lastCheck time.Time) bool {
 	disk := diskMap[endpoint]
 	if disk == nil {
 		return false
 	}
-	return disk.IsOnline()
+	if !disk.IsOnline() {
+		return false
+	}
+	if disk.LastConn().After(lastCheck) {
+		return false
+	}
+	return true
 }
 
-func (s *erasureSets) getDiskMap() map[string]StorageAPI {
-	diskMap := make(map[string]StorageAPI)
+func (s *erasureSets) getDiskMap() map[Endpoint]StorageAPI {
+	diskMap := make(map[Endpoint]StorageAPI)
 
 	s.erasureDisksMu.RLock()
 	defer s.erasureDisksMu.RUnlock()
@@ -121,7 +131,7 @@ func (s *erasureSets) getDiskMap() map[string]StorageAPI {
 			if !disk.IsOnline() {
 				continue
 			}
-			diskMap[disk.String()] = disk
+			diskMap[disk.Endpoint()] = disk
 		}
 	}
 	return diskMap
@@ -195,15 +205,15 @@ func findDiskIndex(refFormat, format *formatErasureV3) (int, int, error) {
 // connectDisks - attempt to connect all the endpoints, loads format
 // and re-arranges the disks in proper position.
 func (s *erasureSets) connectDisks() {
+	defer func() {
+		s.lastConnectDisksOpTime = time.Now()
+	}()
+
 	var wg sync.WaitGroup
 	var setsJustConnected = make([]bool, s.setCount)
 	diskMap := s.getDiskMap()
 	for _, endpoint := range s.endpoints {
-		diskPath := endpoint.String()
-		if endpoint.IsLocal {
-			diskPath = endpoint.Path
-		}
-		if isEndpointConnected(diskMap, diskPath) {
+		if isEndpointConnectionStable(diskMap, endpoint, s.lastConnectDisksOpTime) {
 			continue
 		}
 		wg.Add(1)
@@ -378,6 +388,14 @@ func newErasureSets(ctx context.Context, endpoints Endpoints, storageDisks []Sto
 	// setCount * setDriveCount with each memory upto blockSizeV2.
 	bp := bpool.NewBytePoolCap(n, blockSizeV2, blockSizeV2*2)
 
+	// Initialize byte pool for all sets, bpool size is set to
+	// setCount * setDriveCount with each memory upto blockSizeV1
+	//
+	// Number of buffers, max 10GiB
+	m := (10 * humanize.GiByte) / (blockSizeV1 * 2)
+
+	bpOld := bpool.NewBytePoolCap(m, blockSizeV1, blockSizeV1*2)
+
 	for i := 0; i < setCount; i++ {
 		s.erasureDisks[i] = make([]StorageAPI, setDriveCount)
 	}
@@ -427,6 +445,7 @@ func newErasureSets(ctx context.Context, endpoints Endpoints, storageDisks []Sto
 			deletedCleanupSleeper: newDynamicSleeper(10, 2*time.Second),
 			nsMutex:               mutex,
 			bp:                    bp,
+			bpOld:                 bpOld,
 			mrfOpCh:               make(chan partialOperation, 10000),
 		}
 	}
@@ -499,6 +518,21 @@ type auditObjectOp struct {
 	Disks []string `json:"disks"`
 }
 
+type auditObjectErasureMap struct {
+	sync.Map
+}
+
+// Define how to marshal auditObjectErasureMap so it can be
+// printed in the audit webhook notification request.
+func (a *auditObjectErasureMap) MarshalJSON() ([]byte, error) {
+	mapCopy := make(map[string]auditObjectOp)
+	a.Range(func(k, v interface{}) bool {
+		mapCopy[k.(string)] = v.(auditObjectOp)
+		return true
+	})
+	return json.Marshal(mapCopy)
+}
+
 func auditObjectErasureSet(ctx context.Context, object string, set *erasureObjects) {
 	if len(logger.AuditTargets) == 0 {
 		return
@@ -512,20 +546,20 @@ func auditObjectErasureSet(ctx context.Context, object string, set *erasureObjec
 		Disks: set.getEndpoints(),
 	}
 
-	var objectErasureSetTag map[string]auditObjectOp
+	var objectErasureSetTag *auditObjectErasureMap
 	reqInfo := logger.GetReqInfo(ctx)
 	for _, kv := range reqInfo.GetTags() {
 		if kv.Key == objectErasureMapKey {
-			objectErasureSetTag = kv.Val.(map[string]auditObjectOp)
+			objectErasureSetTag = kv.Val.(*auditObjectErasureMap)
 			break
 		}
 	}
 
 	if objectErasureSetTag == nil {
-		objectErasureSetTag = make(map[string]auditObjectOp)
+		objectErasureSetTag = &auditObjectErasureMap{}
 	}
 
-	objectErasureSetTag[object] = op
+	objectErasureSetTag.Store(object, op)
 	reqInfo.SetTags(objectErasureMapKey, objectErasureSetTag)
 }
 
@@ -804,9 +838,6 @@ func (s *erasureSets) DeleteBucket(ctx context.Context, bucket string, forceDele
 		}
 	}
 
-	// Delete all bucket metadata.
-	deleteBucketMetadata(ctx, s, bucket)
-
 	// Success.
 	return nil
 }
@@ -884,10 +915,25 @@ func (s *erasureSets) GetObjectInfo(ctx context.Context, bucket, object string, 
 	return set.GetObjectInfo(ctx, bucket, object, opts)
 }
 
+func (s *erasureSets) deletePrefix(ctx context.Context, bucket string, prefix string) error {
+	for _, s := range s.sets {
+		_, err := s.DeleteObject(ctx, bucket, prefix, ObjectOptions{DeletePrefix: true})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // DeleteObject - deletes an object from the hashedSet based on the object name.
 func (s *erasureSets) DeleteObject(ctx context.Context, bucket string, object string, opts ObjectOptions) (objInfo ObjectInfo, err error) {
 	set := s.getHashedSet(object)
 	auditObjectErasureSet(ctx, object, set)
+
+	if opts.DeletePrefix {
+		err := s.deletePrefix(ctx, bucket, object)
+		return ObjectInfo{}, err
+	}
 	return set.DeleteObject(ctx, bucket, object, opts)
 }
 
@@ -1405,4 +1451,14 @@ func (s *erasureSets) healMRFRoutine() {
 			s.mrfMU.Unlock()
 		}
 	}
+}
+
+// TransitionObject - transition object content to target tier.
+func (s *erasureSets) TransitionObject(ctx context.Context, bucket, object string, opts ObjectOptions) error {
+	return s.getHashedSet(object).TransitionObject(ctx, bucket, object, opts)
+}
+
+// RestoreTransitionedObject - restore transitioned object content locally on this cluster.
+func (s *erasureSets) RestoreTransitionedObject(ctx context.Context, bucket, object string, opts ObjectOptions) error {
+	return s.getHashedSet(object).RestoreTransitionedObject(ctx, bucket, object, opts)
 }

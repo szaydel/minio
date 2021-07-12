@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2019 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -29,11 +30,10 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/minio/minio/cmd/logger"
-	b "github.com/minio/minio/pkg/bucket/bandwidth"
-	"github.com/minio/minio/pkg/event"
-	"github.com/minio/minio/pkg/madmin"
-	trace "github.com/minio/minio/pkg/trace"
+	"github.com/minio/madmin-go"
+	b "github.com/minio/minio/internal/bucket/bandwidth"
+	"github.com/minio/minio/internal/event"
+	"github.com/minio/minio/internal/logger"
 	"github.com/tinylib/msgp/msgp"
 )
 
@@ -249,7 +249,7 @@ func (s *peerRESTServer) LoadUserHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	var userType = regularUser
+	var userType = regUser
 	if temp {
 		userType = stsUser
 	}
@@ -402,15 +402,15 @@ func (s *peerRESTServer) DispatchNetInfoHandler(w http.ResponseWriter, r *http.R
 	done := keepHTTPResponseAlive(w)
 
 	ctx := newContext(r, w, "DispatchNetInfo")
-	info := globalNotificationSys.NetInfo(ctx)
+	info := globalNotificationSys.GetNetPerfInfo(ctx)
 
 	done(nil)
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
 	w.(http.Flusher).Flush()
 }
 
-// DriveInfoHandler - returns Drive info.
-func (s *peerRESTServer) DriveInfoHandler(w http.ResponseWriter, r *http.Request) {
+// GetDrivePerfInfosHandler - returns all disk's serial/parallal performance information.
+func (s *peerRESTServer) GetDrivePerfInfosHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
 		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
@@ -418,28 +418,15 @@ func (s *peerRESTServer) DriveInfoHandler(w http.ResponseWriter, r *http.Request
 
 	ctx, cancel := context.WithCancel(newContext(r, w, "DriveInfo"))
 	defer cancel()
-	infoSerial := getLocalDrives(ctx, false, globalEndpoints, r)
-	infoParallel := getLocalDrives(ctx, true, globalEndpoints, r)
 
-	errStr := ""
-	if infoSerial.Error != "" {
-		errStr = "serial: " + infoSerial.Error
-	}
-	if infoParallel.Error != "" {
-		errStr = errStr + " parallel: " + infoParallel.Error
-	}
-	info := madmin.ServerDrivesInfo{
-		Addr:     infoSerial.Addr,
-		Serial:   infoSerial.Serial,
-		Parallel: infoParallel.Parallel,
-		Error:    errStr,
-	}
+	info := getDrivePerfInfos(ctx, r.Host)
+
 	defer w.(http.Flusher).Flush()
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
 }
 
-// CPUInfoHandler - returns CPU info.
-func (s *peerRESTServer) CPUInfoHandler(w http.ResponseWriter, r *http.Request) {
+// GetCPUsHandler - returns CPU info.
+func (s *peerRESTServer) GetCPUsHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
 		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
@@ -448,14 +435,14 @@ func (s *peerRESTServer) CPUInfoHandler(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	info := getLocalCPUInfo(ctx, r)
+	info := madmin.GetCPUs(ctx, r.Host)
 
 	defer w.(http.Flusher).Flush()
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
 }
 
-// DiskHwInfoHandler - returns Disk HW info.
-func (s *peerRESTServer) DiskHwInfoHandler(w http.ResponseWriter, r *http.Request) {
+// GetPartitionsHandler - returns disk partition information.
+func (s *peerRESTServer) GetPartitionsHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
 		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
@@ -464,14 +451,14 @@ func (s *peerRESTServer) DiskHwInfoHandler(w http.ResponseWriter, r *http.Reques
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	info := getLocalDiskHwInfo(ctx, r)
+	info := madmin.GetPartitions(ctx, r.Host)
 
 	defer w.(http.Flusher).Flush()
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
 }
 
-// OsInfoHandler - returns Os info.
-func (s *peerRESTServer) OsInfoHandler(w http.ResponseWriter, r *http.Request) {
+// GetOSInfoHandler - returns operating system's information.
+func (s *peerRESTServer) GetOSInfoHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
 		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
@@ -480,14 +467,14 @@ func (s *peerRESTServer) OsInfoHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	info := getLocalOsInfo(ctx, r)
+	info := madmin.GetOSInfo(ctx, r.Host)
 
 	defer w.(http.Flusher).Flush()
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
 }
 
-// ProcInfoHandler - returns Proc info.
-func (s *peerRESTServer) ProcInfoHandler(w http.ResponseWriter, r *http.Request) {
+// GetProcInfoHandler - returns this MinIO process information.
+func (s *peerRESTServer) GetProcInfoHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
 		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
@@ -496,14 +483,14 @@ func (s *peerRESTServer) ProcInfoHandler(w http.ResponseWriter, r *http.Request)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	info := getLocalProcInfo(ctx, r)
+	info := madmin.GetProcInfo(ctx, r.Host)
 
 	defer w.(http.Flusher).Flush()
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
 }
 
-// MemInfoHandler - returns Memory info.
-func (s *peerRESTServer) MemInfoHandler(w http.ResponseWriter, r *http.Request) {
+// GetMemInfoHandler - returns memory information.
+func (s *peerRESTServer) GetMemInfoHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
 		s.writeErrorResponse(w, errors.New("Invalid request"))
 		return
@@ -512,7 +499,7 @@ func (s *peerRESTServer) MemInfoHandler(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	info := getLocalMemInfo(ctx, r)
+	info := madmin.GetMemInfo(ctx, r.Host)
 
 	defer w.(http.Flusher).Flush()
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
@@ -534,6 +521,7 @@ func (s *peerRESTServer) DeleteBucketMetadataHandler(w http.ResponseWriter, r *h
 
 	globalReplicationStats.Delete(bucketName)
 	globalBucketMetadataSys.Remove(bucketName)
+	globalBucketTargetSys.Delete(bucketName)
 	if localMetacacheMgr != nil {
 		localMetacacheMgr.deleteBucketCache(bucketName)
 	}
@@ -980,7 +968,7 @@ func (s *peerRESTServer) TraceHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			w.(http.Flusher).Flush()
 		case <-keepAliveTicker.C:
-			if err := enc.Encode(&trace.Info{}); err != nil {
+			if err := enc.Encode(&madmin.TraceInfo{}); err != nil {
 				return
 			}
 			w.(http.Flusher).Flush()
@@ -1003,6 +991,19 @@ func (s *peerRESTServer) BackgroundHealStatusHandler(w http.ResponseWriter, r *h
 
 	defer w.(http.Flusher).Flush()
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(state))
+}
+
+func (s *peerRESTServer) LoadTransitionTierConfigHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		s.writeErrorResponse(w, errors.New("invalid request"))
+		return
+	}
+	go func() {
+		err := globalTierConfigMgr.Reload(context.Background(), newObjectLayerFn())
+		if err != nil {
+			logger.LogIf(context.Background(), fmt.Errorf("Failed to reload remote tier config %s", err))
+		}
+	}()
 }
 
 // ConsoleLogHandler sends console logs of this node back to peer rest client
@@ -1104,12 +1105,12 @@ func registerPeerRESTHandlers(router *mux.Router) {
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodHealth).HandlerFunc(httpTraceHdrs(server.HealthHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetLocks).HandlerFunc(httpTraceHdrs(server.GetLocksHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodServerInfo).HandlerFunc(httpTraceHdrs(server.ServerInfoHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodProcInfo).HandlerFunc(httpTraceHdrs(server.ProcInfoHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodMemInfo).HandlerFunc(httpTraceHdrs(server.MemInfoHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodOsInfo).HandlerFunc(httpTraceHdrs(server.OsInfoHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDiskHwInfo).HandlerFunc(httpTraceHdrs(server.DiskHwInfoHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodCPUInfo).HandlerFunc(httpTraceHdrs(server.CPUInfoHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDriveInfo).HandlerFunc(httpTraceHdrs(server.DriveInfoHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodProcInfo).HandlerFunc(httpTraceHdrs(server.GetProcInfoHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodMemInfo).HandlerFunc(httpTraceHdrs(server.GetMemInfoHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodOsInfo).HandlerFunc(httpTraceHdrs(server.GetOSInfoHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDiskHwInfo).HandlerFunc(httpTraceHdrs(server.GetPartitionsHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodCPUInfo).HandlerFunc(httpTraceHdrs(server.GetCPUsHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDriveInfo).HandlerFunc(httpTraceHdrs(server.GetDrivePerfInfosHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodNetInfo).HandlerFunc(httpTraceHdrs(server.NetInfoHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDispatchNetInfo).HandlerFunc(httpTraceHdrs(server.DispatchNetInfoHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodCycleBloom).HandlerFunc(httpTraceHdrs(server.CycleServerBloomFilterHandler))
@@ -1138,4 +1139,5 @@ func registerPeerRESTHandlers(router *mux.Router) {
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetMetacacheListing).HandlerFunc(httpTraceHdrs(server.GetMetacacheListingHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodUpdateMetacacheListing).HandlerFunc(httpTraceHdrs(server.UpdateMetacacheListingHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetPeerMetrics).HandlerFunc(httpTraceHdrs(server.GetPeerMetrics))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadTransitionTierConfig).HandlerFunc(httpTraceHdrs(server.LoadTransitionTierConfigHandler))
 }

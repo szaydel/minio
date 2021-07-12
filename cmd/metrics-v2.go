@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2018-2020 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -25,7 +26,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/internal/logger"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
@@ -92,12 +93,11 @@ const (
 	timestampTotal MetricName = "timestamp_total"
 	writeTotal     MetricName = "write_total"
 	total          MetricName = "total"
+	freeInodes     MetricName = "free_inodes"
 
 	failedCount   MetricName = "failed_count"
 	failedBytes   MetricName = "failed_bytes"
 	freeBytes     MetricName = "free_bytes"
-	pendingBytes  MetricName = "pending_bytes"
-	pendingCount  MetricName = "pending_count"
 	readBytes     MetricName = "read_bytes"
 	rcharBytes    MetricName = "rchar_bytes"
 	receivedBytes MetricName = "received_bytes"
@@ -119,6 +119,8 @@ const (
 	lastActivityTime = "last_activity_nano_seconds"
 	startTime        = "starttime_seconds"
 	upTime           = "uptime_seconds"
+	memory           = "resident_memory_bytes"
+	cpu              = "cpu_total_seconds"
 )
 
 const (
@@ -349,6 +351,16 @@ func getClusterDisksTotalMD() MetricDescription {
 	}
 }
 
+func getClusterDisksFreeInodes() MetricDescription {
+	return MetricDescription{
+		Namespace: clusterMetricNamespace,
+		Subsystem: diskSubsystem,
+		Name:      freeInodes,
+		Help:      "Total free inodes.",
+		Type:      gaugeMetric,
+	}
+}
+
 func getNodeDiskTotalBytesMD() MetricDescription {
 	return MetricDescription{
 		Namespace: nodeMetricNamespace,
@@ -386,15 +398,7 @@ func getBucketUsageObjectsTotalMD() MetricDescription {
 		Type:      gaugeMetric,
 	}
 }
-func getBucketRepPendingBytesMD() MetricDescription {
-	return MetricDescription{
-		Namespace: bucketMetricNamespace,
-		Subsystem: replicationSubsystem,
-		Name:      pendingBytes,
-		Help:      "Total bytes pending to replicate.",
-		Type:      gaugeMetric,
-	}
-}
+
 func getBucketRepFailedBytesMD() MetricDescription {
 	return MetricDescription{
 		Namespace: bucketMetricNamespace,
@@ -422,15 +426,7 @@ func getBucketRepReceivedBytesMD() MetricDescription {
 		Type:      gaugeMetric,
 	}
 }
-func getBucketRepPendingOperationsMD() MetricDescription {
-	return MetricDescription{
-		Namespace: bucketMetricNamespace,
-		Subsystem: replicationSubsystem,
-		Name:      pendingCount,
-		Help:      "Total number of objects pending replication",
-		Type:      gaugeMetric,
-	}
-}
+
 func getBucketRepFailedOperationsMD() MetricDescription {
 	return MetricDescription{
 		Namespace: bucketMetricNamespace,
@@ -820,6 +816,24 @@ func getMinIOProcessUptimeMD() MetricDescription {
 		Type:      gaugeMetric,
 	}
 }
+func getMinIOProcessResidentMemory() MetricDescription {
+	return MetricDescription{
+		Namespace: nodeMetricNamespace,
+		Subsystem: processSubsystem,
+		Name:      memory,
+		Help:      "Resident memory size in bytes.",
+		Type:      gaugeMetric,
+	}
+}
+func getMinIOProcessCPUTime() MetricDescription {
+	return MetricDescription{
+		Namespace: nodeMetricNamespace,
+		Subsystem: processSubsystem,
+		Name:      cpu,
+		Help:      "Total user and system CPU time spent in seconds.",
+		Type:      counterMetric,
+	}
+}
 func getMinioProcMetrics() MetricsGroup {
 	return MetricsGroup{
 		id:         "MinioProcMetrics",
@@ -912,6 +926,16 @@ func getMinioProcMetrics() MetricsGroup {
 					Description: getMinIOProcessUptimeMD(),
 					Value:       time.Since(globalBootTime).Seconds(),
 				})
+			metrics = append(metrics,
+				Metric{
+					Description: getMinIOProcessResidentMemory(),
+					Value:       float64(stat.ResidentMemory()),
+				})
+			metrics = append(metrics,
+				Metric{
+					Description: getMinIOProcessCPUTime(),
+					Value:       stat.CPUTime(),
+				})
 			return
 		},
 	}
@@ -999,6 +1023,10 @@ func getNodeHealthMetrics() MetricsGroup {
 		id:         "NodeHealthMetrics",
 		cachedRead: cachedRead,
 		read: func(_ context.Context) (metrics []Metric) {
+			if globalIsGateway {
+				return
+			}
+			metrics = make([]Metric, 0, 16)
 			nodesUp, nodesDown := GetPeerOnlineCount()
 			metrics = append(metrics, Metric{
 				Description: getNodeOnlineTotalMD(),
@@ -1036,7 +1064,7 @@ func getMinioHealingMetrics() MetricsGroup {
 				Value:       float64(time.Since(bgSeq.lastHealActivity)),
 			})
 			metrics = append(metrics, getObjectsScanned(bgSeq)...)
-			metrics = append(metrics, getScannedItems(bgSeq)...)
+			metrics = append(metrics, getHealedItems(bgSeq)...)
 			metrics = append(metrics, getFailedItems(bgSeq)...)
 			return
 		},
@@ -1059,7 +1087,7 @@ func getFailedItems(seq *healSequence) (m []Metric) {
 	return
 }
 
-func getScannedItems(seq *healSequence) (m []Metric) {
+func getHealedItems(seq *healSequence) (m []Metric) {
 	items := seq.getHealedItemsMap()
 	m = make([]Metric, 0, len(items))
 	for k, v := range items {
@@ -1073,9 +1101,9 @@ func getScannedItems(seq *healSequence) (m []Metric) {
 }
 
 func getObjectsScanned(seq *healSequence) (m []Metric) {
-	items := seq.getHealedItemsMap()
+	items := seq.getScannedItemsMap()
 	m = make([]Metric, 0, len(items))
-	for k, v := range seq.getScannedItemsMap() {
+	for k, v := range items {
 		m = append(m, Metric{
 			Description:    getHealObjectsTotalMD(),
 			VariableLabels: map[string]string{"type": string(k)},
@@ -1084,6 +1112,7 @@ func getObjectsScanned(seq *healSequence) (m []Metric) {
 	}
 	return
 }
+
 func getCacheMetrics() MetricsGroup {
 	return MetricsGroup{
 		id:         "CacheMetrics",
@@ -1234,17 +1263,13 @@ func getBucketUsageMetrics() MetricsGroup {
 		id:         "BucketUsageMetrics",
 		cachedRead: cachedRead,
 		read: func(ctx context.Context) (metrics []Metric) {
-			metrics = make([]Metric, 0, 50)
 			objLayer := newObjectLayerFn()
 			// Service not initialized yet
-			if objLayer == nil {
+			if objLayer == nil || globalIsGateway {
 				return
 			}
 
-			if globalIsGateway {
-				return
-			}
-
+			metrics = make([]Metric, 0, 50)
 			dataUsageInfo, err := loadDataUsageFromBackend(ctx, objLayer)
 			if err != nil {
 				return
@@ -1277,11 +1302,6 @@ func getBucketUsageMetrics() MetricsGroup {
 
 				if stat.hasReplicationUsage() {
 					metrics = append(metrics, Metric{
-						Description:    getBucketRepPendingBytesMD(),
-						Value:          float64(stat.PendingSize),
-						VariableLabels: map[string]string{"bucket": bucket},
-					})
-					metrics = append(metrics, Metric{
 						Description:    getBucketRepFailedBytesMD(),
 						Value:          float64(stat.FailedSize),
 						VariableLabels: map[string]string{"bucket": bucket},
@@ -1294,11 +1314,6 @@ func getBucketUsageMetrics() MetricsGroup {
 					metrics = append(metrics, Metric{
 						Description:    getBucketRepReceivedBytesMD(),
 						Value:          float64(stat.ReplicaSize),
-						VariableLabels: map[string]string{"bucket": bucket},
-					})
-					metrics = append(metrics, Metric{
-						Description:    getBucketRepPendingOperationsMD(),
-						Value:          float64(stat.PendingCount),
 						VariableLabels: map[string]string{"bucket": bucket},
 					})
 					metrics = append(metrics, Metric{
@@ -1327,11 +1342,7 @@ func getLocalStorageMetrics() MetricsGroup {
 		read: func(ctx context.Context) (metrics []Metric) {
 			objLayer := newObjectLayerFn()
 			// Service not initialized yet
-			if objLayer == nil {
-				return
-			}
-
-			if globalIsGateway {
+			if objLayer == nil || globalIsGateway {
 				return
 			}
 
@@ -1355,6 +1366,12 @@ func getLocalStorageMetrics() MetricsGroup {
 					Value:          float64(disk.TotalSpace),
 					VariableLabels: map[string]string{"disk": disk.DrivePath},
 				})
+
+				metrics = append(metrics, Metric{
+					Description:    getClusterDisksFreeInodes(),
+					Value:          float64(disk.FreeInodes),
+					VariableLabels: map[string]string{"disk": disk.DrivePath},
+				})
 			}
 			return
 		},
@@ -1367,11 +1384,7 @@ func getClusterStorageMetrics() MetricsGroup {
 		read: func(ctx context.Context) (metrics []Metric) {
 			objLayer := newObjectLayerFn()
 			// Service not initialized yet
-			if objLayer == nil {
-				return
-			}
-
-			if globalIsGateway {
+			if objLayer == nil || !globalIsErasure {
 				return
 			}
 

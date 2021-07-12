@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2015, 2016, 2017, 2018 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -29,18 +30,18 @@ import (
 
 	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/tags"
-	"github.com/minio/minio/cmd/config/dns"
-	"github.com/minio/minio/cmd/crypto"
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/auth"
-	"github.com/minio/minio/pkg/bucket/lifecycle"
-	"github.com/minio/minio/pkg/bucket/replication"
+	"github.com/minio/minio/internal/auth"
+	"github.com/minio/minio/internal/bucket/lifecycle"
+	"github.com/minio/minio/internal/bucket/replication"
+	"github.com/minio/minio/internal/config/dns"
+	"github.com/minio/minio/internal/crypto"
+	"github.com/minio/minio/internal/logger"
 
-	objectlock "github.com/minio/minio/pkg/bucket/object/lock"
-	"github.com/minio/minio/pkg/bucket/policy"
-	"github.com/minio/minio/pkg/bucket/versioning"
-	"github.com/minio/minio/pkg/event"
-	"github.com/minio/minio/pkg/hash"
+	objectlock "github.com/minio/minio/internal/bucket/object/lock"
+	"github.com/minio/minio/internal/bucket/versioning"
+	"github.com/minio/minio/internal/event"
+	"github.com/minio/minio/internal/hash"
+	"github.com/minio/pkg/bucket/policy"
 )
 
 // APIError structure
@@ -114,6 +115,7 @@ const (
 	ErrReplicationDestinationMissingLock
 	ErrRemoteTargetNotFoundError
 	ErrReplicationRemoteConnectionError
+	ErrReplicationBandwidthLimitError
 	ErrBucketRemoteIdenticalToSource
 	ErrBucketRemoteAlreadyExists
 	ErrBucketRemoteLabelInUse
@@ -124,6 +126,7 @@ const (
 	ErrReplicationSourceNotVersionedError
 	ErrReplicationNeedsVersioningError
 	ErrReplicationBucketNeedsVersioningError
+	ErrReplicationNoMatchingRuleError
 	ErrObjectRestoreAlreadyInProgress
 	ErrNoSuchKey
 	ErrNoSuchUpload
@@ -204,7 +207,6 @@ const (
 	ErrInvalidSSECustomerParameters
 	ErrIncompatibleEncryptionMethod
 	ErrKMSNotConfigured
-	ErrKMSAuthFailure
 
 	ErrNoAccessKey
 	ErrInvalidToken
@@ -241,6 +243,7 @@ const (
 	ErrClientDisconnected
 	ErrOperationMaxedOut
 	ErrInvalidRequest
+	ErrTransitionStorageClassNotFoundError
 	// MinIO storage class error codes
 	ErrInvalidStorageClass
 	ErrBackendDown
@@ -765,7 +768,7 @@ var errorCodes = errorCodeMap{
 	},
 	ErrSlowDown: {
 		Code:           "SlowDown",
-		Description:    "Please reduce your request",
+		Description:    "Resource requested is unreadable, please reduce your request rate",
 		HTTPStatusCode: http.StatusServiceUnavailable,
 	},
 	ErrInvalidPrefixMarker: {
@@ -858,6 +861,16 @@ var errorCodes = errorCodeMap{
 		Description:    "Remote service connection error - please check remote service credentials and target bucket",
 		HTTPStatusCode: http.StatusNotFound,
 	},
+	ErrReplicationBandwidthLimitError: {
+		Code:           "XMinioAdminReplicationBandwidthLimitError",
+		Description:    "Bandwidth limit for remote target must be atleast 100MBps",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrReplicationNoMatchingRuleError: {
+		Code:           "XMinioReplicationNoMatchingRule",
+		Description:    "No matching replication rule found for this object prefix",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrBucketRemoteIdenticalToSource: {
 		Code:           "XMinioAdminRemoteIdenticalToSource",
 		Description:    "The remote target cannot be identical to source",
@@ -943,6 +956,12 @@ var errorCodes = errorCodeMap{
 		Description:    "Object restore is already in progress",
 		HTTPStatusCode: http.StatusConflict,
 	},
+	ErrTransitionStorageClassNotFoundError: {
+		Code:           "TransitionStorageClassNotFoundError",
+		Description:    "The transition storage class was not found",
+		HTTPStatusCode: http.StatusNotFound,
+	},
+
 	/// Bucket notification related errors.
 	ErrEventNotification: {
 		Code:           "InvalidArgument",
@@ -1075,14 +1094,9 @@ var errorCodes = errorCodeMap{
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrKMSNotConfigured: {
-		Code:           "InvalidArgument",
+		Code:           "NotImplemented",
 		Description:    "Server side encryption specified but KMS is not configured",
-		HTTPStatusCode: http.StatusBadRequest,
-	},
-	ErrKMSAuthFailure: {
-		Code:           "InvalidArgument",
-		Description:    "Server side encryption specified but KMS authorization failed",
-		HTTPStatusCode: http.StatusBadRequest,
+		HTTPStatusCode: http.StatusNotImplemented,
 	},
 	ErrNoAccessKey: {
 		Code:           "AccessDenied",
@@ -1812,6 +1826,8 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrAdminInvalidAccessKey
 	case auth.ErrInvalidSecretKeyLength:
 		apiErr = ErrAdminInvalidSecretKey
+	case errInvalidStorageClass:
+		apiErr = ErrInvalidStorageClass
 	// SSE errors
 	case errInvalidEncryptionParameters:
 		apiErr = ErrInvalidEncryptionParameters
@@ -1837,8 +1853,6 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrIncompatibleEncryptionMethod
 	case errKMSNotConfigured:
 		apiErr = ErrKMSNotConfigured
-	case crypto.ErrKMSAuthLogin:
-		apiErr = ErrKMSAuthFailure
 	case context.Canceled, context.DeadlineExceeded:
 		apiErr = ErrOperationTimedOut
 	case errDiskNotFound:
@@ -1979,6 +1993,11 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrRemoteTargetNotVersionedError
 	case BucketReplicationSourceNotVersioned:
 		apiErr = ErrReplicationSourceNotVersionedError
+	case TransitionStorageClassNotFound:
+		apiErr = ErrTransitionStorageClassNotFoundError
+	case InvalidObjectState:
+		apiErr = ErrInvalidObjectState
+
 	case BucketQuotaExceeded:
 		apiErr = ErrAdminBucketQuotaExceeded
 	case *event.ErrInvalidEventName:

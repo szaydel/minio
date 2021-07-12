@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -25,8 +26,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/madmin"
+	"github.com/minio/madmin-go"
+	"github.com/minio/minio/internal/logger"
 )
 
 // healStatusSummary - overall short summary of a healing sequence
@@ -485,22 +486,6 @@ func newHealSequence(ctx context.Context, bucket, objPrefix, clientAddr string,
 	}
 }
 
-// resetHealStatusCounters - reset the healSequence status counters between
-// each monthly background heal scanning activity.
-// This is used only in case of Background healing scenario, where
-// we use a single long running healSequence which reactively heals
-// objects passed to the SourceCh.
-func (h *healSequence) resetHealStatusCounters() {
-	h.mutex.Lock()
-	defer h.mutex.Unlock()
-
-	h.currentStatus.Items = []madmin.HealResultItem{}
-	h.lastSentResultIndex = 0
-	h.scannedItemsMap = make(map[madmin.HealItemType]int64)
-	h.healedItemsMap = make(map[madmin.HealItemType]int64)
-	h.healFailedItemsMap = make(map[string]int64)
-}
-
 // getScannedItemsCount - returns a count of all scanned items
 func (h *healSequence) getScannedItemsCount() int64 {
 	var count int64
@@ -834,16 +819,6 @@ func (h *healSequence) healFromSourceCh() {
 }
 
 func (h *healSequence) healDiskMeta(objAPI ObjectLayer) error {
-	// Try to pro-actively heal backend-encrypted file.
-	if err := h.queueHealTask(healSource{
-		bucket: minioMetaBucket,
-		object: backendEncryptedFile,
-	}, madmin.HealItemBucketMetadata); err != nil {
-		if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
-			return err
-		}
-	}
-
 	// Start healing the config prefix.
 	return h.healMinioSysMeta(objAPI, minioConfigPrefix)()
 }

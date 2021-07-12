@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2015-2020 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -42,18 +43,26 @@ import (
 
 	humanize "github.com/dustin/go-humanize"
 	"github.com/gorilla/mux"
-	xhttp "github.com/minio/minio/cmd/http"
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/cmd/rest"
-	"github.com/minio/minio/pkg/certs"
-	"github.com/minio/minio/pkg/handlers"
-	"github.com/minio/minio/pkg/madmin"
-	"golang.org/x/net/http2"
+	"github.com/minio/madmin-go"
+	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
+	"github.com/minio/minio/internal/handlers"
+	xhttp "github.com/minio/minio/internal/http"
+	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/logger/message/audit"
+	"github.com/minio/minio/internal/rest"
+	"github.com/minio/pkg/certs"
 )
 
 const (
 	slashSeparator = "/"
 )
+
+// BucketAccessPolicy - Collection of canned bucket policy at a given prefix.
+type BucketAccessPolicy struct {
+	Bucket string                     `json:"bucket"`
+	Prefix string                     `json:"prefix"`
+	Policy miniogopolicy.BucketPolicy `json:"policy"`
+}
 
 // IsErrIgnored returns whether given error is ignored or not.
 func IsErrIgnored(err error, ignoredErrs ...error) bool {
@@ -456,7 +465,7 @@ func newInternodeHTTPTransport(tlsConfig *tls.Config, dialTimeout time.Duration)
 		WriteBufferSize:       32 << 10, // 32KiB moving up from 4KiB default
 		ReadBufferSize:        32 << 10, // 32KiB moving up from 4KiB default
 		IdleConnTimeout:       15 * time.Second,
-		ResponseHeaderTimeout: 3 * time.Minute, // Set conservative timeouts for MinIO internode.
+		ResponseHeaderTimeout: 15 * time.Minute, // Set conservative timeouts for MinIO internode.
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 15 * time.Second,
 		TLSClientConfig:       tlsConfig,
@@ -511,45 +520,6 @@ func newCustomHTTPProxyTransport(tlsConfig *tls.Config, dialTimeout time.Duratio
 		// gzip disable this feature, as we are always interested
 		// in raw stream.
 		DisableCompression: true,
-	}
-
-	return func() *http.Transport {
-		return tr
-	}
-}
-
-func newCustomHTTPTransportWithHTTP2(tlsConfig *tls.Config, dialTimeout time.Duration) func() *http.Transport {
-	// For more details about various values used here refer
-	// https://golang.org/pkg/net/http/#Transport documentation
-	tr := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           xhttp.DialContextWithDNSCache(globalDNSCache, xhttp.NewInternodeDialContext(dialTimeout)),
-		MaxIdleConnsPerHost:   1024,
-		IdleConnTimeout:       15 * time.Second,
-		ResponseHeaderTimeout: 1 * time.Minute,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 10 * time.Second,
-		TLSClientConfig:       tlsConfig,
-		// Go net/http automatically unzip if content-type is
-		// gzip disable this feature, as we are always interested
-		// in raw stream.
-		DisableCompression: true,
-	}
-
-	if tlsConfig != nil {
-		trhttp2, _ := http2.ConfigureTransports(tr)
-		if trhttp2 != nil {
-			// ReadIdleTimeout is the timeout after which a health check using ping
-			// frame will be carried out if no frame is received on the
-			// connection. 5 minutes is sufficient time for any idle connection.
-			trhttp2.ReadIdleTimeout = 5 * time.Minute
-			// PingTimeout is the timeout after which the connection will be closed
-			// if a response to Ping is not received.
-			trhttp2.PingTimeout = dialTimeout
-			// DisableCompression, if true, prevents the Transport from
-			// requesting compression with an "Accept-Encoding: gzip"
-			trhttp2.DisableCompression = true
-		}
 	}
 
 	return func() *http.Transport {
@@ -960,4 +930,38 @@ func decodeDirObject(object string) string {
 func loadAndResetRPCNetworkErrsCounter() uint64 {
 	defer rest.ResetNetworkErrsCounter()
 	return rest.GetNetworkErrsCounter()
+}
+
+// Helper method to return total number of nodes in cluster
+func totalNodeCount() uint64 {
+	peers, _ := globalEndpoints.peers()
+	totalNodesCount := uint64(len(peers))
+	if totalNodesCount == 0 {
+		totalNodesCount = 1 // For standalone erasure coding
+	}
+	return totalNodesCount
+}
+
+// AuditLogOptions takes options for audit logging subsystem activity
+type AuditLogOptions struct {
+	Trigger   string
+	APIName   string
+	Status    string
+	VersionID string
+}
+
+// sends audit logs for internal subsystem activity
+func auditLogInternal(ctx context.Context, bucket, object string, opts AuditLogOptions) {
+	entry := audit.NewEntry(globalDeploymentID)
+	entry.Trigger = opts.Trigger
+	entry.API.Name = opts.APIName
+	entry.API.Bucket = bucket
+	entry.API.Object = object
+	if opts.VersionID != "" {
+		entry.ReqQuery = make(map[string]string)
+		entry.ReqQuery[xhttp.VersionID] = opts.VersionID
+	}
+	entry.API.Status = opts.Status
+	ctx = logger.SetAuditEntry(ctx, &entry)
+	logger.AuditLog(ctx, nil, nil, nil)
 }

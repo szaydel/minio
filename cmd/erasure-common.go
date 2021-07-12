@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2016-2020 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -20,7 +21,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/minio/minio/pkg/sync/errgroup"
+	"github.com/minio/minio/internal/sync/errgroup"
 )
 
 func (er erasureObjects) getLocalDisks() (localDisks []StorageAPI) {
@@ -60,7 +61,6 @@ func (er erasureObjects) getOnlineDisks() (newDisks []StorageAPI) {
 			}
 			di, err := disks[i-1].DiskInfo(context.Background())
 			if err != nil || di.Healing {
-
 				// - Do not consume disks which are not reachable
 				//   unformatted or simply not accessible for some reason.
 				//
@@ -77,24 +77,6 @@ func (er erasureObjects) getOnlineDisks() (newDisks []StorageAPI) {
 	}
 	wg.Wait()
 	return newDisks
-}
-
-// getLoadBalancedNDisks - fetches load balanced (sufficiently randomized) disk slice
-// with N disks online. If ndisks is zero or negative, then it will returns all disks,
-// same if ndisks is greater than the number of all disks.
-func (er erasureObjects) getLoadBalancedNDisks(ndisks int) (newDisks []StorageAPI) {
-	disks := er.getLoadBalancedDisks(ndisks != -1)
-	for _, disk := range disks {
-		if disk == nil {
-			continue
-		}
-		newDisks = append(newDisks, disk)
-		ndisks--
-		if ndisks == 0 {
-			break
-		}
-	}
-	return
 }
 
 // getLoadBalancedDisks - fetches load balanced (sufficiently randomized) disk slice.

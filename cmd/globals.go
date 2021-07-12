@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2015, 2016, 2017, 2018 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -25,25 +26,26 @@ import (
 	"time"
 
 	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/minio/pkg/bucket/bandwidth"
-	"github.com/minio/minio/pkg/handlers"
-	"github.com/minio/minio/pkg/kms"
+	"github.com/minio/minio/internal/bucket/bandwidth"
+	"github.com/minio/minio/internal/handlers"
+	"github.com/minio/minio/internal/kms"
 
 	"github.com/dustin/go-humanize"
-	"github.com/minio/minio/cmd/config/cache"
-	"github.com/minio/minio/cmd/config/compress"
-	"github.com/minio/minio/cmd/config/dns"
-	xldap "github.com/minio/minio/cmd/config/identity/ldap"
-	"github.com/minio/minio/cmd/config/identity/openid"
-	"github.com/minio/minio/cmd/config/policy/opa"
-	"github.com/minio/minio/cmd/config/storageclass"
-	xhttp "github.com/minio/minio/cmd/http"
-	"github.com/minio/minio/pkg/auth"
-	etcd "go.etcd.io/etcd/clientv3"
+	"github.com/minio/minio/internal/auth"
+	"github.com/minio/minio/internal/config/cache"
+	"github.com/minio/minio/internal/config/compress"
+	"github.com/minio/minio/internal/config/dns"
+	xldap "github.com/minio/minio/internal/config/identity/ldap"
+	"github.com/minio/minio/internal/config/identity/openid"
+	"github.com/minio/minio/internal/config/policy/opa"
+	"github.com/minio/minio/internal/config/storageclass"
+	xhttp "github.com/minio/minio/internal/http"
+	etcd "go.etcd.io/etcd/client/v3"
 
-	"github.com/minio/minio/pkg/certs"
-	"github.com/minio/minio/pkg/event"
-	"github.com/minio/minio/pkg/pubsub"
+	"github.com/minio/minio/internal/event"
+	"github.com/minio/minio/internal/pubsub"
+	"github.com/minio/pkg/certs"
+	xnet "github.com/minio/pkg/net"
 )
 
 // minio configuration related constants.
@@ -106,12 +108,17 @@ const (
 
 	// diskFillFraction is the fraction of a disk we allow to be filled.
 	diskFillFraction = 0.95
+
+	// diskAssumeUnknownSize is the size to assume when an unknown size upload is requested.
+	diskAssumeUnknownSize = 1 << 30
+
+	// diskMinInodes is the minimum number of inodes we want free on a disk to perform writes.
+	diskMinInodes = 1000
 )
 
 var globalCLIContext = struct {
 	JSON, Quiet    bool
 	Anonymous      bool
-	Addr           string
 	StrictS3Compat bool
 }{}
 
@@ -131,6 +138,10 @@ var (
 	// This flag is set to 'true' by default
 	globalBrowserEnabled = true
 
+	// Custom browser redirect URL, not set by default
+	// and it is automatically deduced.
+	globalBrowserRedirectURL *xnet.URL
+
 	// This flag is set to 'true' when MINIO_UPDATE env is set to 'off'. Default is false.
 	globalInplaceUpdateDisabled = false
 
@@ -139,10 +150,17 @@ var (
 
 	// MinIO local server address (in `host:port` format)
 	globalMinioAddr = ""
+
 	// MinIO default port, can be changed through command line.
-	globalMinioPort = GlobalMinioDefaultPort
+	globalMinioPort            = GlobalMinioDefaultPort
+	globalMinioConsolePort     = "13333"
+	globalMinioConsolePortAuto = false
+
 	// Holds the host that was passed using --address
 	globalMinioHost = ""
+	// Holds the host that was passed using --console-address
+	globalMinioConsoleHost = ""
+
 	// Holds the possible host endpoint.
 	globalMinioEndpoint = ""
 
@@ -210,12 +228,6 @@ var (
 	globalBootTime = UTCNow()
 
 	globalActiveCred auth.Credentials
-
-	// Hold the old server credentials passed by the environment
-	globalOldCred auth.Credentials
-
-	// Indicates if config is to be encrypted
-	globalConfigEncrypted bool
 
 	globalPublicCerts []*x509.Certificate
 
@@ -293,20 +305,13 @@ var (
 	globalDNSCache *xhttp.DNSCache
 
 	globalForwarder *handlers.Forwarder
+
+	globalTierConfigMgr *TierConfigMgr
+
+	globalTierJournal *tierJournal
+
+	globalDebugRemoteTiersImmediately []string
 	// Add new variable global values here.
 )
 
 var errSelfTestFailure = errors.New("self test failed. unsafe to start server")
-
-// Returns minio global information, as a key value map.
-// returned list of global values is not an exhaustive
-// list. Feel free to add new relevant fields.
-func getGlobalInfo() (globalInfo map[string]interface{}) {
-	globalInfo = map[string]interface{}{
-		"serverRegion": globalServerRegion,
-		"domains":      globalDomainNames,
-		// Add more relevant global settings here.
-	}
-
-	return globalInfo
-}

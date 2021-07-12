@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2016-2019 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -21,7 +22,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/minio/minio/pkg/madmin"
+	"github.com/minio/madmin-go"
 )
 
 // commonTime returns a maximally occurring time from a list of time.
@@ -188,6 +189,35 @@ func getLatestFileInfo(ctx context.Context, partsMetadata []FileInfo, errs []err
 	return latestFileInfo, nil
 }
 
+// fileInfoConsistent whether all fileinfos are consistent with each other.
+// Will return false if any fileinfo mismatches.
+func fileInfoConsistent(ctx context.Context, partsMetadata []FileInfo, errs []error) bool {
+	// There should be atleast half correct entries, if not return failure
+	if reducedErr := reduceReadQuorumErrs(ctx, errs, nil, len(partsMetadata)/2); reducedErr != nil {
+		return false
+	}
+	if len(partsMetadata) == 1 {
+		return true
+	}
+	// Reference
+	ref := partsMetadata[0]
+	if !ref.IsValid() {
+		return false
+	}
+	for _, meta := range partsMetadata[1:] {
+		if !meta.IsValid() {
+			return false
+		}
+		if !meta.ModTime.Equal(ref.ModTime) {
+			return false
+		}
+		if meta.DataDir != ref.DataDir {
+			return false
+		}
+	}
+	return true
+}
+
 // disksWithAllParts - This function needs to be called with
 // []StorageAPI returned by listOnlineDisks. Returns,
 //
@@ -197,9 +227,11 @@ func getLatestFileInfo(ctx context.Context, partsMetadata []FileInfo, errs []err
 //   a not-found error or a hash-mismatch error.
 func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetadata []FileInfo, errs []error, bucket,
 	object string, scanMode madmin.HealScanMode) ([]StorageAPI, []error) {
+	// List of disks having latest version of the object er.meta  (by modtime)
+	_, modTime, dataDir := listOnlineDisks(onlineDisks, partsMetadata, errs)
+
 	availableDisks := make([]StorageAPI, len(onlineDisks))
 	dataErrs := make([]error, len(onlineDisks))
-
 	inconsistent := 0
 	for i, meta := range partsMetadata {
 		if !meta.IsValid() {
@@ -236,6 +268,13 @@ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetad
 			continue
 		}
 		meta := partsMetadata[i]
+
+		if !meta.ModTime.Equal(modTime) || meta.DataDir != dataDir {
+			dataErrs[i] = errFileCorrupt
+			partsMetadata[i] = FileInfo{}
+			continue
+		}
+
 		if erasureDistributionReliable {
 			if !meta.IsValid() {
 				continue
@@ -261,7 +300,7 @@ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetad
 		// Always check data, if we got it.
 		if (len(meta.Data) > 0 || meta.Size == 0) && len(meta.Parts) > 0 {
 			checksumInfo := meta.Erasure.GetChecksumInfo(meta.Parts[0].Number)
-			dataErrs[i] = bitrotVerify(bytes.NewBuffer(meta.Data),
+			dataErrs[i] = bitrotVerify(bytes.NewReader(meta.Data),
 				int64(len(meta.Data)),
 				meta.Erasure.ShardFileSize(meta.Size),
 				checksumInfo.Algorithm,
@@ -269,6 +308,9 @@ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetad
 			if dataErrs[i] == nil {
 				// All parts verified, mark it as all data available.
 				availableDisks[i] = onlineDisk
+			} else {
+				// upon errors just make that disk's fileinfo invalid
+				partsMetadata[i] = FileInfo{}
 			}
 			continue
 		}
@@ -278,14 +320,21 @@ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetad
 			// disk has a valid xl.meta but may not have all the
 			// parts. This is considered an outdated disk, since
 			// it needs healing too.
-			dataErrs[i] = onlineDisk.VerifyFile(ctx, bucket, object, partsMetadata[i])
+			if !partsMetadata[i].IsRemote() {
+				dataErrs[i] = onlineDisk.VerifyFile(ctx, bucket, object, partsMetadata[i])
+			}
 		case madmin.HealNormalScan:
-			dataErrs[i] = onlineDisk.CheckParts(ctx, bucket, object, partsMetadata[i])
+			if !partsMetadata[i].IsRemote() {
+				dataErrs[i] = onlineDisk.CheckParts(ctx, bucket, object, partsMetadata[i])
+			}
 		}
 
 		if dataErrs[i] == nil {
 			// All parts verified, mark it as all data available.
 			availableDisks[i] = onlineDisk
+		} else {
+			// upon errors just make that disk's fileinfo invalid
+			partsMetadata[i] = FileInfo{}
 		}
 	}
 

@@ -1,29 +1,32 @@
-/*
- * MinIO Cloud Storage, (C) 2018-2020 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
 import (
+	"math"
 	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/madmin"
+	"github.com/minio/madmin-go"
+	"github.com/minio/minio/internal/logger"
+	iampolicy "github.com/minio/pkg/iam/policy"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -179,7 +182,7 @@ func healingMetricsPrometheus(ch chan<- prometheus.Metric) {
 				"Objects for which healing failed in current self healing run",
 				[]string{"mount_path", "volume_status"}, nil),
 			prometheus.GaugeValue,
-			float64(v), string(s[0]), string(s[1]),
+			float64(v), s[0], s[1],
 		)
 	}
 }
@@ -439,56 +442,23 @@ func getLatestReplicationStats(bucket string, u madmin.BucketUsageInfo) (s Bucke
 	for _, bucketStat := range bucketStats {
 		replStats.FailedCount += bucketStat.ReplicationStats.FailedCount
 		replStats.FailedSize += bucketStat.ReplicationStats.FailedSize
-		replStats.PendingCount += bucketStat.ReplicationStats.PendingCount
-		replStats.PendingSize += bucketStat.ReplicationStats.PendingSize
 		replStats.ReplicaSize += bucketStat.ReplicationStats.ReplicaSize
 		replStats.ReplicatedSize += bucketStat.ReplicationStats.ReplicatedSize
 	}
 	usageStat := globalReplicationStats.GetInitialUsage(bucket)
-	replStats.FailedCount += usageStat.FailedCount
-	replStats.FailedSize += usageStat.FailedSize
-	replStats.PendingCount += usageStat.PendingCount
-	replStats.PendingSize += usageStat.PendingSize
 	replStats.ReplicaSize += usageStat.ReplicaSize
 	replStats.ReplicatedSize += usageStat.ReplicatedSize
 
 	// use in memory replication stats if it is ahead of usage info.
+	s.ReplicatedSize = u.ReplicatedSize
 	if replStats.ReplicatedSize >= u.ReplicatedSize {
 		s.ReplicatedSize = replStats.ReplicatedSize
-	} else {
-		s.ReplicatedSize = u.ReplicatedSize
 	}
-
-	if replStats.PendingSize > u.ReplicationPendingSize {
-		s.PendingSize = replStats.PendingSize
-	} else {
-		s.PendingSize = u.ReplicationPendingSize
-	}
-
-	if replStats.FailedSize > u.ReplicationFailedSize {
-		s.FailedSize = replStats.FailedSize
-	} else {
-		s.FailedSize = u.ReplicationFailedSize
-	}
-
-	if replStats.ReplicaSize > u.ReplicaSize {
-		s.ReplicaSize = replStats.ReplicaSize
-	} else {
-		s.ReplicaSize = u.ReplicaSize
-	}
-
-	if replStats.PendingCount > u.ReplicationPendingCount {
-		s.PendingCount = replStats.PendingCount
-	} else {
-		s.PendingCount = u.ReplicationPendingCount
-	}
-
-	if replStats.FailedCount > u.ReplicationFailedCount {
-		s.FailedCount = replStats.FailedCount
-	} else {
-		s.FailedCount = u.ReplicationFailedCount
-	}
-
+	// Reset FailedSize and FailedCount to 0 for negative overflows which can
+	// happen since data usage picture can lag behind actual usage state at the time of cluster start
+	s.FailedSize = uint64(math.Max(float64(replStats.FailedSize), 0))
+	s.FailedCount = uint64(math.Max(float64(replStats.FailedCount), 0))
+	s.ReplicaSize = uint64(math.Max(float64(replStats.ReplicaSize), float64(u.ReplicaSize)))
 	return s
 }
 
@@ -537,15 +507,6 @@ func bucketUsageMetricsPrometheus(ch chan<- prometheus.Metric) {
 		)
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
-				prometheus.BuildFQName("bucket", "replication", "pending_size"),
-				"Total capacity pending to be replicated",
-				[]string{"bucket"}, nil),
-			prometheus.GaugeValue,
-			float64(stat.PendingSize),
-			bucket,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(
 				prometheus.BuildFQName("bucket", "replication", "failed_size"),
 				"Total capacity failed to replicate at least once",
 				[]string{"bucket"}, nil),
@@ -569,15 +530,6 @@ func bucketUsageMetricsPrometheus(ch chan<- prometheus.Metric) {
 				[]string{"bucket"}, nil),
 			prometheus.GaugeValue,
 			float64(stat.ReplicaSize),
-			bucket,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(
-				prometheus.BuildFQName("bucket", "replication", "pending_count"),
-				"Total replication operations pending",
-				[]string{"bucket"}, nil),
-			prometheus.GaugeValue,
-			float64(stat.PendingCount),
 			bucket,
 		)
 		ch <- prometheus.MustNewConstMetric(
@@ -751,8 +703,19 @@ func metricsHandler() http.Handler {
 // AuthMiddleware checks if the bearer token is valid and authorized.
 func AuthMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		claims, _, authErr := webRequestAuthenticate(r)
+		claims, owner, authErr := webRequestAuthenticate(r)
 		if authErr != nil || !claims.VerifyIssuer("prometheus", true) {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		// For authenticated users apply IAM policy.
+		if !globalIAMSys.IsAllowed(iampolicy.Args{
+			AccountName:     claims.AccessKey,
+			Action:          iampolicy.PrometheusAdminAction,
+			ConditionValues: getConditionValues(r, "", claims.AccessKey, claims.Map()),
+			IsOwner:         owner,
+			Claims:          claims.Map(),
+		}) {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}

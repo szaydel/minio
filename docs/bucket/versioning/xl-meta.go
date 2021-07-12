@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2020 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package main
 
@@ -26,6 +27,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
 
 	"github.com/minio/cli"
 	"github.com/tinylib/msgp/msgp"
@@ -41,6 +43,11 @@ func main() {
 
 USAGE:
   {{.Name}} {{if .VisibleFlags}}[FLAGS]{{end}} METAFILES...
+
+Multiple files can be added.
+Wildcards are accepted: testdir/*.txt will compress all files in testdir ending with .txt
+Directories can be wildcards as well. testdir/*/*.txt will match testdir/subdir/b.txt
+
 {{if .VisibleFlags}}
 GLOBAL FLAGS:
   {{range .VisibleFlags}}{{.}}
@@ -58,13 +65,28 @@ GLOBAL FLAGS:
 			Usage: "Display inline data keys and sizes",
 			Name:  "data",
 		},
+		cli.BoolFlag{
+			Usage: "Export inline data",
+			Name:  "export",
+		},
 	}
 
 	app.Action = func(c *cli.Context) error {
-		files := c.Args()
-		if len(files) == 0 {
+		args := c.Args()
+		if len(args) == 0 {
 			// If no args, assume xl.meta
-			files = []string{"xl.meta"}
+			args = []string{"xl.meta"}
+		}
+		var files []string
+		for _, pattern := range args {
+			found, err := filepath.Glob(pattern)
+			if err != nil {
+				return err
+			}
+			if len(found) == 0 {
+				return fmt.Errorf("unable to find file %v", pattern)
+			}
+			files = append(files, found...)
 		}
 		for _, file := range files {
 			var r io.Reader
@@ -122,6 +144,14 @@ GLOBAL FLAGS:
 					return err
 				}
 				buf = bytes.NewBuffer(b)
+			}
+			if c.Bool("export") {
+				err := data.files(func(name string, data []byte) {
+					ioutil.WriteFile(fmt.Sprintf("%s-%s.data", file, name), data, os.ModePerm)
+				})
+				if err != nil {
+					return err
+				}
 			}
 			if c.Bool("ndjson") {
 				fmt.Println(buf.String())
@@ -255,4 +285,39 @@ func (x xlMetaInlineData) json() ([]byte, error) {
 	}
 	res = append(res, '}')
 	return res, nil
+}
+
+// files returns files as callback.
+func (x xlMetaInlineData) files(fn func(name string, data []byte)) error {
+	if len(x) == 0 {
+		return nil
+	}
+	if !x.versionOK() {
+		return errors.New("xlMetaInlineData: unknown version")
+	}
+
+	sz, buf, err := msgp.ReadMapHeaderBytes(x.afterVersion())
+	if err != nil {
+		return err
+	}
+
+	for i := uint32(0); i < sz; i++ {
+		var key, val []byte
+		key, buf, err = msgp.ReadMapKeyZC(buf)
+		if err != nil {
+			return err
+		}
+		if len(key) == 0 {
+			return fmt.Errorf("xlMetaInlineData: key %d is length 0", i)
+		}
+		// Read data...
+		val, buf, err = msgp.ReadBytesZC(buf)
+		if err != nil {
+			return err
+		}
+		// Call back.
+		fn(string(key), val)
+	}
+	return nil
+
 }
