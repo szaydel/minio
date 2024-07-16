@@ -22,7 +22,6 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"reflect"
@@ -109,6 +108,21 @@ func TestJSONQueries(t *testing.T) {
 			name:       "donatello-2",
 			query:      `SELECT * from s3object s WHERE 'bar' in s.synonyms[*]`,
 			wantResult: `{"id":0,"title":"Test Record","desc":"Some text","synonyms":["foo","bar","whatever"]}`,
+		},
+		{
+			name:       "in-expression-precedence-1",
+			query:      "select * from s3object s where 'bar' in s.synonyms and s.id = 0",
+			wantResult: `{"id":0,"title":"Test Record","desc":"Some text","synonyms":["foo","bar","whatever"]}`,
+		},
+		{
+			name:       "in-expression-precedence-2",
+			query:      "select * from s3object s where 'some' in ('somex', s.synonyms[0]) and s.id = 1",
+			wantResult: `{"id":1,"title":"Second Record","desc":"another text","synonyms":["some","synonym","value"]}`,
+		},
+		{
+			name:       "in-expression-with-aggregation",
+			query:      "select SUM(s.id) from s3object s Where 2 in s.numbers[*] or 'some' in s.synonyms[*]",
+			wantResult: `{"_1":3}`,
 		},
 		{
 			name:  "bignum-1",
@@ -636,7 +650,7 @@ func TestJSONQueries(t *testing.T) {
 			s3Select.Close()
 			resp := http.Response{
 				StatusCode:    http.StatusOK,
-				Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
 				ContentLength: int64(len(w.response)),
 			}
 			res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -644,7 +658,7 @@ func TestJSONQueries(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			got, err := ioutil.ReadAll(res)
+			got, err := io.ReadAll(res)
 			if err != nil {
 				t.Error(err)
 				return
@@ -682,7 +696,7 @@ func TestJSONQueries(t *testing.T) {
 			s3Select.Close()
 			resp := http.Response{
 				StatusCode:    http.StatusOK,
-				Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
 				ContentLength: int64(len(w.response)),
 			}
 			res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -690,7 +704,7 @@ func TestJSONQueries(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			got, err := ioutil.ReadAll(res)
+			got, err := io.ReadAll(res)
 			if err != nil {
 				t.Error(err)
 				return
@@ -763,7 +777,7 @@ func TestCSVQueries(t *testing.T) {
 			s3Select.Close()
 			resp := http.Response{
 				StatusCode:    http.StatusOK,
-				Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
 				ContentLength: int64(len(w.response)),
 			}
 			res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -771,7 +785,7 @@ func TestCSVQueries(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			got, err := ioutil.ReadAll(res)
+			got, err := io.ReadAll(res)
 			if err != nil {
 				t.Error(err)
 				return
@@ -946,7 +960,7 @@ func TestCSVQueries2(t *testing.T) {
 			s3Select.Close()
 			resp := http.Response{
 				StatusCode:    http.StatusOK,
-				Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
 				ContentLength: int64(len(w.response)),
 			}
 			res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -954,7 +968,7 @@ func TestCSVQueries2(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			got, err := ioutil.ReadAll(res)
+			got, err := io.ReadAll(res)
 			if err != nil {
 				t.Error(err)
 				return
@@ -1090,7 +1104,7 @@ true`,
 			s3Select.Close()
 			resp := http.Response{
 				StatusCode:    http.StatusOK,
-				Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
 				ContentLength: int64(len(w.response)),
 			}
 			res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -1098,7 +1112,7 @@ true`,
 				t.Error(err)
 				return
 			}
-			got, err := ioutil.ReadAll(res)
+			got, err := io.ReadAll(res)
 			if err != nil {
 				t.Error(err)
 				return
@@ -1236,7 +1250,7 @@ func TestCSVInput(t *testing.T) {
 			if !reflect.DeepEqual(w.response, testCase.expectedResult) {
 				resp := http.Response{
 					StatusCode:    http.StatusOK,
-					Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+					Body:          io.NopCloser(bytes.NewReader(w.response)),
 					ContentLength: int64(len(w.response)),
 				}
 				res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -1244,7 +1258,7 @@ func TestCSVInput(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				got, err := ioutil.ReadAll(res)
+				got, err := io.ReadAll(res)
 				if err != nil {
 					t.Error(err)
 					return
@@ -1356,7 +1370,7 @@ func TestJSONInput(t *testing.T) {
 			if !reflect.DeepEqual(w.response, testCase.expectedResult) {
 				resp := http.Response{
 					StatusCode:    http.StatusOK,
-					Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+					Body:          io.NopCloser(bytes.NewReader(w.response)),
 					ContentLength: int64(len(w.response)),
 				}
 				res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -1364,7 +1378,7 @@ func TestJSONInput(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				got, err := ioutil.ReadAll(res)
+				got, err := io.ReadAll(res)
 				if err != nil {
 					t.Error(err)
 					return
@@ -1550,6 +1564,36 @@ func TestCSVRanges(t *testing.T) {
 </SelectObjectContentRequest>`),
 		},
 		{
+			name: "var-field-count",
+			input: []byte(`id,time,num,num2,text
+1,2010-01-01T,7867786,4565.908123
+2,2017-01-02T03:04Z,-5, 0.765111,Some some
+`),
+			// Since we are doing offset, no headers are used.
+			wantResult: `{"id":"1","time":"2010-01-01T","num":"7867786","num2":"4565.908123"}
+{"id":"2","time":"2017-01-02T03:04Z","num":"-5","num2":" 0.765111","text":"Some some"}`,
+			wantErr: false,
+			requestXML: []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<SelectObjectContentRequest>
+    <Expression>SELECT * from s3object</Expression>
+    <ExpressionType>SQL</ExpressionType>
+    <InputSerialization>
+        <CompressionType>NONE</CompressionType>
+        <CSV>
+        <FileHeaderInfo>USE</FileHeaderInfo>
+	    <QuoteCharacter>"</QuoteCharacter>
+        </CSV>
+    </InputSerialization>
+    <OutputSerialization>
+        <JSON>
+        </JSON>
+    </OutputSerialization>
+    <RequestProgress>
+        <Enabled>FALSE</Enabled>
+    </RequestProgress>
+</SelectObjectContentRequest>`),
+		},
+		{
 			name:  "error-after-eof",
 			input: testInput,
 			// Since we are doing offset, no headers are used.
@@ -1633,7 +1677,7 @@ func TestCSVRanges(t *testing.T) {
 			s3Select.Close()
 			resp := http.Response{
 				StatusCode:    http.StatusOK,
-				Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
 				ContentLength: int64(len(w.response)),
 			}
 			res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -1641,7 +1685,7 @@ func TestCSVRanges(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			got, err := ioutil.ReadAll(res)
+			got, err := io.ReadAll(res)
 			if err != nil {
 				t.Error(err)
 				return
@@ -1655,7 +1699,11 @@ func TestCSVRanges(t *testing.T) {
 }
 
 func TestParquetInput(t *testing.T) {
-	t.Setenv("MINIO_API_SELECT_PARQUET", "on")
+	saved := parquetSupport
+	defer func() {
+		parquetSupport = saved
+	}()
+	parquetSupport = true
 
 	testTable := []struct {
 		requestXML     []byte
@@ -1735,7 +1783,7 @@ func TestParquetInput(t *testing.T) {
 			if !reflect.DeepEqual(w.response, testCase.expectedResult) {
 				resp := http.Response{
 					StatusCode:    http.StatusOK,
-					Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+					Body:          io.NopCloser(bytes.NewReader(w.response)),
 					ContentLength: int64(len(w.response)),
 				}
 				res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -1743,7 +1791,7 @@ func TestParquetInput(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				got, err := ioutil.ReadAll(res)
+				got, err := io.ReadAll(res)
 				if err != nil {
 					t.Error(err)
 					return
@@ -1756,7 +1804,11 @@ func TestParquetInput(t *testing.T) {
 }
 
 func TestParquetInputSchema(t *testing.T) {
-	t.Setenv("MINIO_API_SELECT_PARQUET", "on")
+	saved := parquetSupport
+	defer func() {
+		parquetSupport = saved
+	}()
+	parquetSupport = true
 
 	testTable := []struct {
 		requestXML []byte
@@ -1836,7 +1888,7 @@ func TestParquetInputSchema(t *testing.T) {
 			s3Select.Close()
 			resp := http.Response{
 				StatusCode:    http.StatusOK,
-				Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
 				ContentLength: int64(len(w.response)),
 			}
 			res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -1844,7 +1896,7 @@ func TestParquetInputSchema(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			got, err := ioutil.ReadAll(res)
+			got, err := io.ReadAll(res)
 			if err != nil {
 				t.Error(err)
 				return
@@ -1858,7 +1910,11 @@ func TestParquetInputSchema(t *testing.T) {
 }
 
 func TestParquetInputSchemaCSV(t *testing.T) {
-	t.Setenv("MINIO_API_SELECT_PARQUET", "on")
+	saved := parquetSupport
+	defer func() {
+		parquetSupport = saved
+	}()
+	parquetSupport = true
 
 	testTable := []struct {
 		requestXML []byte
@@ -1936,7 +1992,7 @@ func TestParquetInputSchemaCSV(t *testing.T) {
 			s3Select.Close()
 			resp := http.Response{
 				StatusCode:    http.StatusOK,
-				Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
 				ContentLength: int64(len(w.response)),
 			}
 			res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -1944,7 +2000,7 @@ func TestParquetInputSchemaCSV(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			got, err := ioutil.ReadAll(res)
+			got, err := io.ReadAll(res)
 			if err != nil {
 				t.Error(err)
 				return

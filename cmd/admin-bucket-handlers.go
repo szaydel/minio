@@ -25,25 +25,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/gorilla/mux"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/klauspost/compress/zip"
-	"github.com/minio/kes"
-	"github.com/minio/madmin-go"
+	"github.com/minio/kms-go/kes"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	objectlock "github.com/minio/minio/internal/bucket/object/lock"
 	"github.com/minio/minio/internal/bucket/versioning"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/kms"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/bucket/policy"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/mux"
+	"github.com/minio/pkg/v3/policy"
 )
 
 const (
@@ -57,25 +54,22 @@ const (
 // specified in the quota configuration will be applied by default
 // to enforce total quota for the specified bucket.
 func (a adminAPIHandlers) PutBucketQuotaConfigHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "PutBucketQuotaConfig")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.SetBucketQuotaAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.SetBucketQuotaAdminAction)
 	if objectAPI == nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 		return
 	}
 
 	vars := mux.Vars(r)
 	bucket := pathClean(vars["bucket"])
 
-	if _, err := objectAPI.GetBucketInfo(ctx, bucket); err != nil {
+	if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
-	data, err := ioutil.ReadAll(r.Body)
+	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
 		return
@@ -84,11 +78,6 @@ func (a adminAPIHandlers) PutBucketQuotaConfigHandler(w http.ResponseWriter, r *
 	quotaConfig, err := parseBucketQuota(bucket, data)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-		return
-	}
-
-	if quotaConfig.Type == "fifo" {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
 		return
 	}
 
@@ -104,15 +93,12 @@ func (a adminAPIHandlers) PutBucketQuotaConfigHandler(w http.ResponseWriter, r *
 		Quota:     data,
 		UpdatedAt: updatedAt,
 	}
-	if quotaConfig.Quota == 0 {
+	if quotaConfig.Size == 0 && quotaConfig.Quota == 0 {
 		bucketMeta.Quota = nil
 	}
 
 	// Call site replication hook.
-	if err = globalSiteReplicationSys.BucketMetaHook(ctx, bucketMeta); err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-		return
-	}
+	replLogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, bucketMeta))
 
 	// Write success response.
 	writeSuccessResponseHeadersOnly(w)
@@ -120,20 +106,17 @@ func (a adminAPIHandlers) PutBucketQuotaConfigHandler(w http.ResponseWriter, r *
 
 // GetBucketQuotaConfigHandler - gets bucket quota configuration
 func (a adminAPIHandlers) GetBucketQuotaConfigHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "GetBucketQuotaConfig")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.GetBucketQuotaAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.GetBucketQuotaAdminAction)
 	if objectAPI == nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 		return
 	}
 
 	vars := mux.Vars(r)
 	bucket := pathClean(vars["bucket"])
 
-	if _, err := objectAPI.GetBucketInfo(ctx, bucket); err != nil {
+	if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -156,32 +139,25 @@ func (a adminAPIHandlers) GetBucketQuotaConfigHandler(w http.ResponseWriter, r *
 
 // SetRemoteTargetHandler - sets a remote target for bucket
 func (a adminAPIHandlers) SetRemoteTargetHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "SetBucketTarget")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 	vars := mux.Vars(r)
 	bucket := pathClean(vars["bucket"])
 	update := r.Form.Get("update") == "true"
 
-	if globalIsGateway {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
-		return
-	}
-
 	// Get current object layer instance.
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.SetBucketTargetAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.SetBucketTargetAction)
 	if objectAPI == nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 		return
 	}
 
 	// Check if bucket exists.
-	if _, err := objectAPI.GetBucketInfo(ctx, bucket); err != nil {
+	if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
-	cred, _, _, s3Err := validateAdminSignature(ctx, r, "")
+	cred, _, s3Err := validateAdminSignature(ctx, r, "")
 	if s3Err != ErrNone {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
 		return
@@ -210,12 +186,28 @@ func (a adminAPIHandlers) SetRemoteTargetHandler(w http.ResponseWriter, r *http.
 	if update {
 		ops = madmin.GetTargetUpdateOps(r.Form)
 	} else {
-		target.Arn = globalBucketTargetSys.getRemoteARN(bucket, &target)
+		var exists bool // true if arn exists
+		target.Arn, exists = globalBucketTargetSys.getRemoteARN(bucket, &target, "")
+		if exists && target.Arn != "" { // return pre-existing ARN
+			data, err := json.Marshal(target.Arn)
+			if err != nil {
+				writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+				return
+			}
+			// Write success response.
+			writeSuccessResponseJSON(w, data)
+			return
+		}
 	}
 	if target.Arn == "" {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrAdminConfigBadJSON, err), r.URL)
 		return
 	}
+	if globalSiteReplicationSys.isEnabled() && !update {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrRemoteTargetDenyAddError, err), r.URL)
+		return
+	}
+
 	if update {
 		// overlay the updates on existing target
 		tgt := globalBucketTargetSys.GetRemoteBucketTargetByArn(ctx, bucket, target.Arn)
@@ -226,10 +218,14 @@ func (a adminAPIHandlers) SetRemoteTargetHandler(w http.ResponseWriter, r *http.
 		for _, op := range ops {
 			switch op {
 			case madmin.CredentialsUpdateType:
-				tgt.Credentials = target.Credentials
-				tgt.TargetBucket = target.TargetBucket
-				tgt.Secure = target.Secure
-				tgt.Endpoint = target.Endpoint
+				if !globalSiteReplicationSys.isEnabled() {
+					// credentials update is possible only in bucket replication. User will never
+					// know the site replicator creds.
+					tgt.Credentials = target.Credentials
+					tgt.TargetBucket = target.TargetBucket
+					tgt.Secure = target.Secure
+					tgt.Endpoint = target.Endpoint
+				}
 			case madmin.SyncUpdateType:
 				tgt.ReplicationSync = target.ReplicationSync
 			case madmin.ProxyUpdateType:
@@ -252,7 +248,7 @@ func (a adminAPIHandlers) SetRemoteTargetHandler(w http.ResponseWriter, r *http.
 	}
 	if err = globalBucketTargetSys.SetTarget(ctx, bucket, &target, update); err != nil {
 		switch err.(type) {
-		case BucketRemoteConnectionErr:
+		case RemoteTargetConnectionErr:
 			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrReplicationRemoteConnectionError, err), r.URL)
 		default:
 			writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
@@ -286,26 +282,20 @@ func (a adminAPIHandlers) SetRemoteTargetHandler(w http.ResponseWriter, r *http.
 // ListRemoteTargetsHandler - lists remote target(s) for a bucket or gets a target
 // for a particular ARN type
 func (a adminAPIHandlers) ListRemoteTargetsHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ListBucketTargets")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 	vars := mux.Vars(r)
 	bucket := pathClean(vars["bucket"])
 	arnType := vars["type"]
 
-	if globalIsGateway {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
-		return
-	}
 	// Get current object layer instance.
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.GetBucketTargetAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.GetBucketTargetAction)
 	if objectAPI == nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 		return
 	}
 	if bucket != "" {
 		// Check if bucket exists.
-		if _, err := objectAPI.GetBucketInfo(ctx, bucket); err != nil {
+		if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 			writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
 			return
 		}
@@ -326,26 +316,20 @@ func (a adminAPIHandlers) ListRemoteTargetsHandler(w http.ResponseWriter, r *htt
 
 // RemoveRemoteTargetHandler - removes a remote target for bucket with specified ARN
 func (a adminAPIHandlers) RemoveRemoteTargetHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "RemoveBucketTarget")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 	vars := mux.Vars(r)
 	bucket := pathClean(vars["bucket"])
 	arn := vars["arn"]
 
-	if globalIsGateway {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
-		return
-	}
 	// Get current object layer instance.
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.SetBucketTargetAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.SetBucketTargetAction)
 	if objectAPI == nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 		return
 	}
 
 	// Check if bucket exists.
-	if _, err := objectAPI.GetBucketInfo(ctx, bucket); err != nil {
+	if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -375,33 +359,28 @@ func (a adminAPIHandlers) RemoveRemoteTargetHandler(w http.ResponseWriter, r *ht
 
 // ExportBucketMetadataHandler - exports all bucket metadata as a zipped file
 func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ExportBucketMetadata")
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	ctx := r.Context()
 
 	bucket := pathClean(r.Form.Get("bucket"))
-	if !globalIsErasure {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
-		return
-	}
 	// Get current object layer instance.
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ExportBucketMetadataAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ExportBucketMetadataAction)
 	if objectAPI == nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 		return
 	}
+
 	var (
 		buckets []BucketInfo
 		err     error
 	)
 	if bucket != "" {
 		// Check if bucket exists.
-		if _, err := objectAPI.GetBucketInfo(ctx, bucket); err != nil {
+		if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 			writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
 			return
 		}
 		buckets = append(buckets, BucketInfo{Name: bucket})
 	} else {
-		buckets, err = objectAPI.ListBuckets(ctx)
+		buckets, err = objectAPI.ListBuckets(ctx, BucketOptions{})
 		if err != nil {
 			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 			return
@@ -412,7 +391,8 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 	// of bucket metadata
 	zipWriter := zip.NewWriter(w)
 	defer zipWriter.Close()
-	rawDataFn := func(r io.Reader, filename string, sz int) error {
+
+	rawDataFn := func(r io.Reader, filename string, sz int) {
 		header, zerr := zip.FileInfoHeader(dummyFileInfo{
 			name:    filename,
 			size:    int64(sz),
@@ -421,20 +401,13 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 			isDir:   false,
 			sys:     nil,
 		})
-		if zerr != nil {
-			logger.LogIf(ctx, zerr)
-			return nil
+		if zerr == nil {
+			header.Method = zip.Deflate
+			zwriter, zerr := zipWriter.CreateHeader(header)
+			if zerr == nil {
+				io.Copy(zwriter, r)
+			}
 		}
-		header.Method = zip.Deflate
-		zwriter, zerr := zipWriter.CreateHeader(header)
-		if zerr != nil {
-			logger.LogIf(ctx, zerr)
-			return nil
-		}
-		if _, err := io.Copy(zwriter, r); err != nil {
-			logger.LogIf(ctx, err)
-		}
-		return nil
 	}
 
 	cfgFiles := []string{
@@ -457,7 +430,7 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 			case bucketNotificationConfig:
 				config, err := globalBucketMetadataSys.GetNotificationConfig(bucket)
 				if err != nil {
-					logger.LogIf(ctx, err)
+					adminLogIf(ctx, err)
 					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
 					return
 				}
@@ -466,17 +439,14 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
 					return
 				}
-				if err = rawDataFn(bytes.NewReader(configData), cfgPath, len(configData)); err != nil {
-					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
-					return
-				}
+				rawDataFn(bytes.NewReader(configData), cfgPath, len(configData))
 			case bucketLifecycleConfig:
-				config, err := globalBucketMetadataSys.GetLifecycleConfig(bucket)
+				config, _, err := globalBucketMetadataSys.GetLifecycleConfig(bucket)
 				if err != nil {
 					if errors.Is(err, BucketLifecycleNotFound{Bucket: bucket}) {
 						continue
 					}
-					logger.LogIf(ctx, err)
+					adminLogIf(ctx, err)
 					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
 					return
 				}
@@ -485,10 +455,7 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
 					return
 				}
-				if err = rawDataFn(bytes.NewReader(configData), cfgPath, len(configData)); err != nil {
-					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
-					return
-				}
+				rawDataFn(bytes.NewReader(configData), cfgPath, len(configData))
 			case bucketQuotaConfigFile:
 				config, _, err := globalBucketMetadataSys.GetQuotaConfig(ctx, bucket)
 				if err != nil {
@@ -503,10 +470,7 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 					writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 					return
 				}
-				if err = rawDataFn(bytes.NewReader(configData), cfgPath, len(configData)); err != nil {
-					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
-					return
-				}
+				rawDataFn(bytes.NewReader(configData), cfgPath, len(configData))
 			case bucketSSEConfig:
 				config, _, err := globalBucketMetadataSys.GetSSEConfig(bucket)
 				if err != nil {
@@ -521,10 +485,7 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
 					return
 				}
-				if err = rawDataFn(bytes.NewReader(configData), cfgPath, len(configData)); err != nil {
-					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
-					return
-				}
+				rawDataFn(bytes.NewReader(configData), cfgPath, len(configData))
 			case bucketTaggingConfig:
 				config, _, err := globalBucketMetadataSys.GetTaggingConfig(bucket)
 				if err != nil {
@@ -539,10 +500,7 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
 					return
 				}
-				if err = rawDataFn(bytes.NewReader(configData), cfgPath, len(configData)); err != nil {
-					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
-					return
-				}
+				rawDataFn(bytes.NewReader(configData), cfgPath, len(configData))
 			case objectLockConfig:
 				config, _, err := globalBucketMetadataSys.GetObjectLockConfig(bucket)
 				if err != nil {
@@ -558,10 +516,7 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
 					return
 				}
-				if err = rawDataFn(bytes.NewReader(configData), cfgPath, len(configData)); err != nil {
-					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
-					return
-				}
+				rawDataFn(bytes.NewReader(configData), cfgPath, len(configData))
 			case bucketVersioningConfig:
 				config, _, err := globalBucketMetadataSys.GetVersioningConfig(bucket)
 				if err != nil {
@@ -577,10 +532,7 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
 					return
 				}
-				if err = rawDataFn(bytes.NewReader(configData), cfgPath, len(configData)); err != nil {
-					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
-					return
-				}
+				rawDataFn(bytes.NewReader(configData), cfgPath, len(configData))
 			case bucketReplicationConfig:
 				config, _, err := globalBucketMetadataSys.GetReplicationConfig(ctx, bucket)
 				if err != nil {
@@ -595,11 +547,7 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
 					return
 				}
-
-				if err = rawDataFn(bytes.NewReader(configData), cfgPath, len(configData)); err != nil {
-					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
-					return
-				}
+				rawDataFn(bytes.NewReader(configData), cfgPath, len(configData))
 			case bucketTargetsFile:
 				config, err := globalBucketMetadataSys.GetBucketTargetsConfig(bucket)
 				if err != nil {
@@ -615,13 +563,43 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
 					return
 				}
-				if err = rawDataFn(bytes.NewReader(configData), cfgPath, len(configData)); err != nil {
-					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
-					return
-				}
+				rawDataFn(bytes.NewReader(configData), cfgPath, len(configData))
 			}
 		}
 	}
+}
+
+type importMetaReport struct {
+	madmin.BucketMetaImportErrs
+}
+
+func (i *importMetaReport) SetStatus(bucket, fname string, err error) {
+	st := i.Buckets[bucket]
+	var errMsg string
+	if err != nil {
+		errMsg = err.Error()
+	}
+	switch fname {
+	case bucketPolicyConfig:
+		st.Policy = madmin.MetaStatus{IsSet: true, Err: errMsg}
+	case bucketNotificationConfig:
+		st.Notification = madmin.MetaStatus{IsSet: true, Err: errMsg}
+	case bucketLifecycleConfig:
+		st.Lifecycle = madmin.MetaStatus{IsSet: true, Err: errMsg}
+	case bucketSSEConfig:
+		st.SSEConfig = madmin.MetaStatus{IsSet: true, Err: errMsg}
+	case bucketTaggingConfig:
+		st.Tagging = madmin.MetaStatus{IsSet: true, Err: errMsg}
+	case bucketQuotaConfigFile:
+		st.Quota = madmin.MetaStatus{IsSet: true, Err: errMsg}
+	case objectLockConfig:
+		st.ObjectLock = madmin.MetaStatus{IsSet: true, Err: errMsg}
+	case bucketVersioningConfig:
+		st.Versioning = madmin.MetaStatus{IsSet: true, Err: errMsg}
+	default:
+		st.Err = errMsg
+	}
+	i.Buckets[bucket] = st
 }
 
 // ImportBucketMetadataHandler - imports all bucket metadata from a zipped file and overwrite bucket metadata config
@@ -630,22 +608,14 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 // 2. Replication config - is omitted from import as remote target credentials are not available from exported data for security reasons.
 // 3. lifecycle config - if transition rules are present, tier name needs to have been defined.
 func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ImportBucketMetadata")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-	bucket := pathClean(r.Form.Get("bucket"))
-
-	if !globalIsErasure {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
-		return
-	}
 	// Get current object layer instance.
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ImportBucketMetadataAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ImportBucketMetadataAction)
 	if objectAPI == nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 		return
 	}
-	data, err := ioutil.ReadAll(r.Body)
+	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
 		return
@@ -656,79 +626,73 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
 		return
 	}
-	bucketMap := make(map[string]struct{}, 1)
+	rpt := importMetaReport{
+		madmin.BucketMetaImportErrs{
+			Buckets: make(map[string]madmin.BucketStatus, len(zr.File)),
+		},
+	}
+
+	bucketMap := make(map[string]*BucketMetadata, len(zr.File))
+
+	updatedAt := UTCNow()
+
+	for _, file := range zr.File {
+		slc := strings.Split(file.Name, slashSeparator)
+		if len(slc) != 2 { // expecting bucket/configfile in the zipfile
+			rpt.SetStatus(file.Name, "", fmt.Errorf("malformed zip - expecting format bucket/<config.json>"))
+			continue
+		}
+		bucket := slc[0]
+		meta, err := readBucketMetadata(ctx, objectAPI, bucket)
+		if err == nil {
+			bucketMap[bucket] = &meta
+		} else if err != errConfigNotFound {
+			rpt.SetStatus(bucket, "", err)
+		}
+	}
 
 	// import object lock config if any - order of import matters here.
 	for _, file := range zr.File {
 		slc := strings.Split(file.Name, slashSeparator)
 		if len(slc) != 2 { // expecting bucket/configfile in the zipfile
-			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
-			return
+			rpt.SetStatus(file.Name, "", fmt.Errorf("malformed zip - expecting format bucket/<config.json>"))
+			continue
 		}
-		b, fileName := slc[0], slc[1]
-		if bucket == "" { // use bucket requested in query parameters if specified. Otherwise default bucket name to directory name within zip
-			bucket = b
-		}
-		switch fileName {
-		case objectLockConfig:
+		bucket, fileName := slc[0], slc[1]
+		if fileName == objectLockConfig {
 			reader, err := file.Open()
 			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
 			config, err := objectlock.ParseObjectLockConfig(reader)
 			if err != nil {
-				apiErr := errorCodes.ToAPIErr(ErrMalformedXML)
-				apiErr.Description = err.Error()
-				writeErrorResponse(ctx, w, apiErr, r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, fmt.Errorf("%s (%s)", errorCodes[ErrMalformedXML].Description, err))
+				continue
 			}
 
 			configData, err := xml.Marshal(config)
 			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
 			if _, ok := bucketMap[bucket]; !ok {
-				opts := BucketOptions{
-					LockEnabled: config.ObjectLockEnabled == "Enabled",
+				opts := MakeBucketOptions{
+					LockEnabled: config.Enabled(),
+					ForceCreate: true, // ignore if it already exists
 				}
-				err = objectAPI.MakeBucketWithLocation(ctx, bucket, opts)
+				err = objectAPI.MakeBucket(ctx, bucket, opts)
 				if err != nil {
-					if _, ok := err.(BucketExists); !ok {
-						writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-						return
-					}
+					rpt.SetStatus(bucket, fileName, err)
+					continue
 				}
-				bucketMap[bucket] = struct{}{}
+				v, _ := globalBucketMetadataSys.Get(bucket)
+				bucketMap[bucket] = &v
 			}
 
-			// Deny object locking configuration settings on existing buckets without object lock enabled.
-			if _, _, err = globalBucketMetadataSys.GetObjectLockConfig(bucket); err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
-			}
-
-			updatedAt, err := globalBucketMetadataSys.Update(ctx, bucket, objectLockConfig, configData)
-			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
-			}
-
-			// Call site replication hook.
-			//
-			// We encode the xml bytes as base64 to ensure there are no encoding
-			// errors.
-			cfgStr := base64.StdEncoding.EncodeToString(configData)
-			if err = globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
-				Type:             madmin.SRBucketMetaTypeObjectLockConfig,
-				Bucket:           bucket,
-				ObjectLockConfig: &cfgStr,
-				UpdatedAt:        updatedAt,
-			}); err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
-			}
+			bucketMap[bucket].ObjectLockConfigXML = configData
+			bucketMap[bucket].ObjectLockConfigUpdatedAt = updatedAt
+			rpt.SetStatus(bucket, fileName, nil)
 		}
 	}
 
@@ -736,334 +700,400 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 	for _, file := range zr.File {
 		slc := strings.Split(file.Name, slashSeparator)
 		if len(slc) != 2 { // expecting bucket/configfile in the zipfile
-			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
-			return
+			rpt.SetStatus(file.Name, "", fmt.Errorf("malformed zip - expecting format bucket/<config.json>"))
+			continue
 		}
-		b, fileName := slc[0], slc[1]
-		if bucket == "" { // use bucket requested in query parameters if specified. Otherwise default bucket name to directory name within zip
-			bucket = b
-		}
-		switch fileName {
-		case bucketVersioningConfig:
+		bucket, fileName := slc[0], slc[1]
+		if fileName == bucketVersioningConfig {
 			reader, err := file.Open()
 			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
 			v, err := versioning.ParseConfig(io.LimitReader(reader, maxBucketVersioningConfigSize))
 			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
 			if _, ok := bucketMap[bucket]; !ok {
-				err = objectAPI.MakeBucketWithLocation(ctx, bucket, BucketOptions{})
-				if err != nil {
-					if _, ok := err.(BucketExists); !ok {
-						writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-						return
-					}
+				if err = objectAPI.MakeBucket(ctx, bucket, MakeBucketOptions{
+					ForceCreate: true, // ignore if it already exists
+				}); err != nil {
+					rpt.SetStatus(bucket, fileName, err)
+					continue
 				}
-				bucketMap[bucket] = struct{}{}
+				v, _ := globalBucketMetadataSys.Get(bucket)
+				bucketMap[bucket] = &v
 			}
 
 			if globalSiteReplicationSys.isEnabled() && v.Suspended() {
-				writeErrorResponse(ctx, w, APIError{
-					Code:           "InvalidBucketState",
-					Description:    "Cluster replication is enabled for this site, so the versioning state cannot be changed.",
-					HTTPStatusCode: http.StatusConflict,
-				}, r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, fmt.Errorf("Cluster replication is enabled for this site, so the versioning state cannot be suspended."))
+				continue
 			}
 
 			if rcfg, _ := globalBucketObjectLockSys.Get(bucket); rcfg.LockEnabled && v.Suspended() {
-				writeErrorResponse(ctx, w, APIError{
-					Code:           "InvalidBucketState",
-					Description:    "An Object Lock configuration is present on this bucket, so the versioning state cannot be changed.",
-					HTTPStatusCode: http.StatusConflict,
-				}, r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, fmt.Errorf("An Object Lock configuration is present on this bucket, so the versioning state cannot be suspended."))
+				continue
 			}
-			if _, err := getReplicationConfig(ctx, bucket); err == nil && v.Suspended() {
-				writeErrorResponse(ctx, w, APIError{
-					Code:           "InvalidBucketState",
-					Description:    "A replication configuration is present on this bucket, so the versioning state cannot be changed.",
-					HTTPStatusCode: http.StatusConflict,
-				}, r.URL)
-				return
+			if rcfg, _ := getReplicationConfig(ctx, bucket); rcfg != nil && v.Suspended() {
+				rpt.SetStatus(bucket, fileName, fmt.Errorf("A replication configuration is present on this bucket, so the versioning state cannot be suspended."))
+				continue
 			}
 
 			configData, err := xml.Marshal(v)
 			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, fmt.Errorf("%s (%s)", errorCodes[ErrMalformedXML].Description, err))
+				continue
 			}
 
-			if _, err = globalBucketMetadataSys.Update(ctx, bucket, bucketVersioningConfig, configData); err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
-			}
+			bucketMap[bucket].VersioningConfigXML = configData
+			bucketMap[bucket].VersioningConfigUpdatedAt = updatedAt
+			rpt.SetStatus(bucket, fileName, nil)
 		}
 	}
 
 	for _, file := range zr.File {
 		reader, err := file.Open()
 		if err != nil {
-			writeErrorResponse(ctx, w, importError(ctx, err, file.Name, ""), r.URL)
-			return
+			rpt.SetStatus(file.Name, "", err)
+			continue
 		}
 		sz := file.FileInfo().Size()
 		slc := strings.Split(file.Name, slashSeparator)
 		if len(slc) != 2 { // expecting bucket/configfile in the zipfile
-			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
-			return
+			rpt.SetStatus(file.Name, "", fmt.Errorf("malformed zip - expecting format bucket/<config.json>"))
+			continue
 		}
-		b, fileName := slc[0], slc[1]
-		if bucket == "" { // use bucket requested in query parameters if specified. Otherwise default bucket name to directory name within zip
-			bucket = b
-		}
+		bucket, fileName := slc[0], slc[1]
+
 		// create bucket if it does not exist yet.
 		if _, ok := bucketMap[bucket]; !ok {
-			err = objectAPI.MakeBucketWithLocation(ctx, bucket, BucketOptions{})
+			err = objectAPI.MakeBucket(ctx, bucket, MakeBucketOptions{
+				ForceCreate: true, // ignore if it already exists
+			})
 			if err != nil {
-				if _, ok := err.(BucketExists); !ok {
-					writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-					return
-				}
+				rpt.SetStatus(bucket, "", err)
+				continue
 			}
-			bucketMap[bucket] = struct{}{}
+			v, _ := globalBucketMetadataSys.Get(bucket)
+			bucketMap[bucket] = &v
+		}
+		if _, ok := bucketMap[bucket]; !ok {
+			continue
 		}
 		switch fileName {
 		case bucketNotificationConfig:
-			config, err := event.ParseConfig(io.LimitReader(reader, sz), globalSite.Region, globalNotificationSys.targetList)
+			config, err := event.ParseConfig(io.LimitReader(reader, sz), globalSite.Region(), globalEventNotifier.targetList)
 			if err != nil {
-				apiErr := errorCodes.ToAPIErr(ErrMalformedXML)
-				if event.IsEventError(err) {
-					apiErr = importError(ctx, err, file.Name, bucket)
-				}
-				writeErrorResponse(ctx, w, apiErr, r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, fmt.Errorf("%s (%s)", errorCodes[ErrMalformedXML].Description, err))
+				continue
 			}
 
 			configData, err := xml.Marshal(config)
 			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
 
-			if _, err = globalBucketMetadataSys.Update(ctx, bucket, bucketNotificationConfig, configData); err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
-			}
-			rulesMap := config.ToRulesMap()
-			globalNotificationSys.AddRulesMap(bucket, rulesMap)
+			bucketMap[bucket].NotificationConfigXML = configData
+			rpt.SetStatus(bucket, fileName, nil)
 		case bucketPolicyConfig:
 			// Error out if Content-Length is beyond allowed size.
 			if sz > maxBucketPolicySize {
-				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrPolicyTooLarge), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, fmt.Errorf(ErrPolicyTooLarge.String()))
+				continue
 			}
 
-			bucketPolicyBytes, err := ioutil.ReadAll(io.LimitReader(reader, sz))
+			bucketPolicyBytes, err := io.ReadAll(io.LimitReader(reader, sz))
 			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
 
-			bucketPolicy, err := policy.ParseConfig(bytes.NewReader(bucketPolicyBytes), bucket)
+			bucketPolicy, err := policy.ParseBucketPolicyConfig(bytes.NewReader(bucketPolicyBytes), bucket)
 			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
 
 			// Version in policy must not be empty
 			if bucketPolicy.Version == "" {
-				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMalformedPolicy), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, fmt.Errorf(ErrPolicyInvalidVersion.String()))
+				continue
 			}
 
 			configData, err := json.Marshal(bucketPolicy)
 			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
 
-			updatedAt, err := globalBucketMetadataSys.Update(ctx, bucket, bucketPolicyConfig, configData)
-			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
-			}
-			// Call site replication hook.
-			if err = globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
-				Type:      madmin.SRBucketMetaTypePolicy,
-				Bucket:    bucket,
-				Policy:    bucketPolicyBytes,
-				UpdatedAt: updatedAt,
-			}); err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
-			}
-
+			bucketMap[bucket].PolicyConfigJSON = configData
+			bucketMap[bucket].PolicyConfigUpdatedAt = updatedAt
+			rpt.SetStatus(bucket, fileName, nil)
 		case bucketLifecycleConfig:
 			bucketLifecycle, err := lifecycle.ParseLifecycleConfig(io.LimitReader(reader, sz))
 			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
-
+			rcfg, err := globalBucketObjectLockSys.Get(bucket)
+			if err != nil {
+				rpt.SetStatus(bucket, fileName, err)
+				continue
+			}
 			// Validate the received bucket policy document
-			if err = bucketLifecycle.Validate(); err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+			if err = bucketLifecycle.Validate(rcfg); err != nil {
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
 
 			// Validate the transition storage ARNs
 			if err = validateTransitionTier(bucketLifecycle); err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
 
 			configData, err := xml.Marshal(bucketLifecycle)
 			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
 
-			if _, err = globalBucketMetadataSys.Update(ctx, bucket, bucketLifecycleConfig, configData); err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
-			}
+			bucketMap[bucket].LifecycleConfigXML = configData
+			bucketMap[bucket].LifecycleConfigUpdatedAt = updatedAt
+			rpt.SetStatus(bucket, fileName, nil)
 		case bucketSSEConfig:
 			// Parse bucket encryption xml
 			encConfig, err := validateBucketSSEConfig(io.LimitReader(reader, maxBucketSSEConfigSize))
 			if err != nil {
-				apiErr := APIError{
-					Code:           "MalformedXML",
-					Description:    fmt.Sprintf("%s (%s)", errorCodes[ErrMalformedXML].Description, err),
-					HTTPStatusCode: errorCodes[ErrMalformedXML].HTTPStatusCode,
-				}
-				writeErrorResponse(ctx, w, apiErr, r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, fmt.Errorf("%s (%s)", errorCodes[ErrMalformedXML].Description, err))
+				continue
 			}
 
 			// Return error if KMS is not initialized
 			if GlobalKMS == nil {
-				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrKMSNotConfigured), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, fmt.Errorf("%s", errorCodes[ErrKMSNotConfigured].Description))
+				continue
 			}
 			kmsKey := encConfig.KeyID()
 			if kmsKey != "" {
-				kmsContext := kms.Context{"MinIO admin API": "ServerInfoHandler"} // Context for a test key operation
-				_, err := GlobalKMS.GenerateKey(kmsKey, kmsContext)
+				_, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{
+					Name:           kmsKey,
+					AssociatedData: kms.Context{"MinIO admin API": "ServerInfoHandler"}, // Context for a test key operation
+				})
 				if err != nil {
 					if errors.Is(err, kes.ErrKeyNotFound) {
-						writeErrorResponse(ctx, w, importError(ctx, errKMSKeyNotFound, file.Name, bucket), r.URL)
-						return
+						rpt.SetStatus(bucket, fileName, errKMSKeyNotFound)
+						continue
 					}
-					writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-					return
+					rpt.SetStatus(bucket, fileName, err)
+					continue
 				}
 			}
 
 			configData, err := xml.Marshal(encConfig)
 			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
 
-			// Store the bucket encryption configuration in the object layer
-			updatedAt, err := globalBucketMetadataSys.Update(ctx, bucket, bucketSSEConfig, configData)
-			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
-			}
-
-			// Call site replication hook.
-			//
-			// We encode the xml bytes as base64 to ensure there are no encoding
-			// errors.
-			cfgStr := base64.StdEncoding.EncodeToString(configData)
-			if err = globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
-				Type:      madmin.SRBucketMetaTypeSSEConfig,
-				Bucket:    bucket,
-				SSEConfig: &cfgStr,
-				UpdatedAt: updatedAt,
-			}); err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
-			}
-
+			bucketMap[bucket].EncryptionConfigXML = configData
+			bucketMap[bucket].EncryptionConfigUpdatedAt = updatedAt
+			rpt.SetStatus(bucket, fileName, nil)
 		case bucketTaggingConfig:
 			tags, err := tags.ParseBucketXML(io.LimitReader(reader, sz))
 			if err != nil {
-				apiErr := errorCodes.ToAPIErrWithErr(ErrMalformedXML, fmt.Errorf("error importing %s with %w", file.Name, err))
-				writeErrorResponse(ctx, w, apiErr, r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, fmt.Errorf("%s (%s)", errorCodes[ErrMalformedXML].Description, err))
+				continue
 			}
 
 			configData, err := xml.Marshal(tags)
 			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
 
-			updatedAt, err := globalBucketMetadataSys.Update(ctx, bucket, bucketTaggingConfig, configData)
-			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
-			}
-			// Call site replication hook.
-			//
-			// We encode the xml bytes as base64 to ensure there are no encoding
-			// errors.
-			cfgStr := base64.StdEncoding.EncodeToString(configData)
-			if err = globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
-				Type:      madmin.SRBucketMetaTypeTags,
-				Bucket:    bucket,
-				Tags:      &cfgStr,
-				UpdatedAt: updatedAt,
-			}); err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
-			}
+			bucketMap[bucket].TaggingConfigXML = configData
+			bucketMap[bucket].TaggingConfigUpdatedAt = updatedAt
+			rpt.SetStatus(bucket, fileName, nil)
 		case bucketQuotaConfigFile:
-			data, err := ioutil.ReadAll(reader)
+			data, err := io.ReadAll(reader)
 			if err != nil {
-				writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
 
-			quotaConfig, err := parseBucketQuota(bucket, data)
+			_, err = parseBucketQuota(bucket, data)
 			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
-				return
+				rpt.SetStatus(bucket, fileName, err)
+				continue
 			}
 
-			if quotaConfig.Type == "fifo" {
-				writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
+			bucketMap[bucket].QuotaConfigJSON = data
+			bucketMap[bucket].QuotaConfigUpdatedAt = updatedAt
+			rpt.SetStatus(bucket, fileName, nil)
+		}
+	}
+
+	enc := func(b []byte) *string {
+		if b == nil {
+			return nil
+		}
+		v := base64.StdEncoding.EncodeToString(b)
+		return &v
+	}
+
+	for bucket, meta := range bucketMap {
+		err := globalBucketMetadataSys.save(ctx, *meta)
+		if err != nil {
+			rpt.SetStatus(bucket, "", err)
+			continue
+		}
+		// Call site replication hook.
+		if err = globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
+			Bucket:           bucket,
+			Quota:            meta.QuotaConfigJSON,
+			Policy:           meta.PolicyConfigJSON,
+			Versioning:       enc(meta.VersioningConfigXML),
+			Tags:             enc(meta.TaggingConfigXML),
+			ObjectLockConfig: enc(meta.ObjectLockConfigXML),
+			SSEConfig:        enc(meta.EncryptionConfigXML),
+			UpdatedAt:        updatedAt,
+		}); err != nil {
+			rpt.SetStatus(bucket, "", err)
+			continue
+		}
+
+	}
+
+	rptData, err := json.Marshal(rpt.BucketMetaImportErrs)
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
+	writeSuccessResponseJSON(w, rptData)
+}
+
+// ReplicationDiffHandler - POST returns info on unreplicated versions for a remote target ARN
+// to the connected HTTP client.
+func (a adminAPIHandlers) ReplicationDiffHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ReplicationDiff)
+	if objectAPI == nil {
+		return
+	}
+
+	// Check if bucket exists.
+	if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+	opts := extractReplicateDiffOpts(r.Form)
+	if opts.ARN != "" {
+		tgt := globalBucketTargetSys.GetRemoteBucketTargetByArn(ctx, bucket, opts.ARN)
+		if tgt.Empty() {
+			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrInvalidRequest, fmt.Errorf("invalid arn : '%s'", opts.ARN)), r.URL)
+			return
+		}
+	}
+
+	keepAliveTicker := time.NewTicker(500 * time.Millisecond)
+	defer keepAliveTicker.Stop()
+
+	diffCh, err := getReplicationDiff(ctx, objectAPI, bucket, opts)
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+	enc := json.NewEncoder(w)
+	for {
+		select {
+		case entry, ok := <-diffCh:
+			if !ok {
 				return
 			}
-
-			updatedAt, err := globalBucketMetadataSys.Update(ctx, bucket, bucketQuotaConfigFile, data)
-			if err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
+			if err := enc.Encode(entry); err != nil {
 				return
 			}
-
-			bucketMeta := madmin.SRBucketMeta{
-				Type:      madmin.SRBucketMetaTypeQuotaConfig,
-				Bucket:    bucket,
-				Quota:     data,
-				UpdatedAt: updatedAt,
+			if len(diffCh) == 0 {
+				// Flush if nothing is queued
+				w.(http.Flusher).Flush()
 			}
-			if quotaConfig.Quota == 0 {
-				bucketMeta.Quota = nil
+		case <-keepAliveTicker.C:
+			if len(diffCh) > 0 {
+				continue
 			}
-
-			// Call site replication hook.
-			if err = globalSiteReplicationSys.BucketMetaHook(ctx, bucketMeta); err != nil {
-				writeErrorResponse(ctx, w, importError(ctx, err, file.Name, bucket), r.URL)
+			if _, err := w.Write([]byte(" ")); err != nil {
 				return
 			}
+			w.(http.Flusher).Flush()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// ReplicationMRFHandler - POST returns info on entries in the MRF backlog for a node or all nodes
+func (a adminAPIHandlers) ReplicationMRFHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ReplicationDiff)
+	if objectAPI == nil {
+		return
+	}
+
+	// Check if bucket exists.
+	if bucket != "" {
+		if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
+	}
+
+	q := r.Form
+	node := q.Get("node")
+
+	keepAliveTicker := time.NewTicker(500 * time.Millisecond)
+	defer keepAliveTicker.Stop()
+
+	mrfCh, err := globalNotificationSys.GetReplicationMRF(ctx, bucket, node)
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+	enc := json.NewEncoder(w)
+	for {
+		select {
+		case entry, ok := <-mrfCh:
+			if !ok {
+				return
+			}
+			if err := enc.Encode(entry); err != nil {
+				return
+			}
+			if len(mrfCh) == 0 {
+				// Flush if nothing is queued
+				w.(http.Flusher).Flush()
+			}
+		case <-keepAliveTicker.C:
+			if len(mrfCh) > 0 {
+				continue
+			}
+			if _, err := w.Write([]byte(" ")); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+		case <-ctx.Done():
+			return
 		}
 	}
 }

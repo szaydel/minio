@@ -18,10 +18,8 @@
 package ldap
 
 import (
-	"crypto/tls"
 	"errors"
 	"fmt"
-	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -29,204 +27,246 @@ import (
 	ldap "github.com/go-ldap/ldap/v3"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/auth"
+	xldap "github.com/minio/pkg/v3/ldap"
 )
 
-func getGroups(conn *ldap.Conn, sreq *ldap.SearchRequest) ([]string, error) {
-	var groups []string
-	sres, err := conn.Search(sreq)
+// LookupUserDN searches for the full DN and groups of a given short/login
+// username.
+func (l *Config) LookupUserDN(username string) (*xldap.DNSearchResult, []string, error) {
+	conn, err := l.LDAP.Connect()
 	if err != nil {
-		// Check if there is no matching result and return empty slice.
-		// Ref: https://ldap.com/ldap-result-code-reference/
-		if ldap.IsErrorWithCode(err, 32) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	for _, entry := range sres.Entries {
-		// We only queried one attribute,
-		// so we only look up the first one.
-		groups = append(groups, entry.DN)
-	}
-	return groups, nil
-}
-
-func (l *Config) lookupBind(conn *ldap.Conn) error {
-	var err error
-	if l.LookupBindPassword == "" {
-		err = conn.UnauthenticatedBind(l.LookupBindDN)
-	} else {
-		err = conn.Bind(l.LookupBindDN, l.LookupBindPassword)
-	}
-	if ldap.IsErrorWithCode(err, 49) {
-		return fmt.Errorf("LDAP Lookup Bind user invalid credentials error: %w", err)
-	}
-	return err
-}
-
-// lookupUserDN searches for the DN of the user given their username. conn is
-// assumed to be using the lookup bind service account. It is required that the
-// search result in at most one result.
-func (l *Config) lookupUserDN(conn *ldap.Conn, username string) (string, error) {
-	filter := strings.ReplaceAll(l.UserDNSearchFilter, "%s", ldap.EscapeFilter(username))
-	var foundDistNames []string
-	for _, userSearchBase := range l.UserDNSearchBaseDistNames {
-		searchRequest := ldap.NewSearchRequest(
-			userSearchBase,
-			ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
-			filter,
-			[]string{}, // only need DN, so no pass no attributes here
-			nil,
-		)
-
-		searchResult, err := conn.Search(searchRequest)
-		if err != nil {
-			return "", err
-		}
-
-		for _, entry := range searchResult.Entries {
-			foundDistNames = append(foundDistNames, entry.DN)
-		}
-	}
-	if len(foundDistNames) == 0 {
-		return "", fmt.Errorf("User DN for %s not found", username)
-	}
-	if len(foundDistNames) != 1 {
-		return "", fmt.Errorf("Multiple DNs for %s found - please fix the search filter", username)
-	}
-	return foundDistNames[0], nil
-}
-
-func (l *Config) searchForUserGroups(conn *ldap.Conn, username, bindDN string) ([]string, error) {
-	// User groups lookup.
-	var groups []string
-	if l.GroupSearchFilter != "" {
-		for _, groupSearchBase := range l.GroupSearchBaseDistNames {
-			filter := strings.ReplaceAll(l.GroupSearchFilter, "%s", ldap.EscapeFilter(username))
-			filter = strings.ReplaceAll(filter, "%d", ldap.EscapeFilter(bindDN))
-			searchRequest := ldap.NewSearchRequest(
-				groupSearchBase,
-				ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
-				filter,
-				nil,
-				nil,
-			)
-
-			var newGroups []string
-			newGroups, err := getGroups(conn, searchRequest)
-			if err != nil {
-				errRet := fmt.Errorf("Error finding groups of %s: %w", bindDN, err)
-				return nil, errRet
-			}
-
-			groups = append(groups, newGroups...)
-		}
-	}
-
-	return groups, nil
-}
-
-// LookupUserDN searches for the full DN and groups of a given username
-func (l *Config) LookupUserDN(username string) (string, []string, error) {
-	conn, err := l.Connect()
-	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	defer conn.Close()
 
 	// Bind to the lookup user account
-	if err = l.lookupBind(conn); err != nil {
-		return "", nil, err
+	if err = l.LDAP.LookupBind(conn); err != nil {
+		return nil, nil, err
 	}
 
 	// Lookup user DN
-	bindDN, err := l.lookupUserDN(conn, username)
+	lookupRes, err := l.LDAP.LookupUsername(conn, username)
 	if err != nil {
 		errRet := fmt.Errorf("Unable to find user DN: %w", err)
-		return "", nil, errRet
+		return nil, nil, errRet
 	}
 
-	groups, err := l.searchForUserGroups(conn, username, bindDN)
+	groups, err := l.LDAP.SearchForUserGroups(conn, username, lookupRes.ActualDN)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 
-	return bindDN, groups, nil
+	return lookupRes, groups, nil
+}
+
+// GetValidatedDNForUsername checks if the given username exists in the LDAP directory.
+// The given username could be just the short "login" username or the full DN.
+//
+// When the username/DN is found, the full DN returned by the **server** is
+// returned, otherwise the returned string is empty. The value returned here is
+// the value sent by the LDAP server and is used in minio as the server performs
+// LDAP specific normalization (including Unicode normalization).
+//
+// If the user is not found, err = nil, otherwise, err != nil.
+func (l *Config) GetValidatedDNForUsername(username string) (*xldap.DNSearchResult, error) {
+	conn, err := l.LDAP.Connect()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	// Bind to the lookup user account
+	if err = l.LDAP.LookupBind(conn); err != nil {
+		return nil, err
+	}
+
+	// Check if the passed in username is a valid DN.
+	if !l.ParsesAsDN(username) {
+		// We consider it as a login username and attempt to check it exists in
+		// the directory.
+		bindDN, err := l.LDAP.LookupUsername(conn, username)
+		if err != nil {
+			if strings.Contains(err.Error(), "User DN not found for") {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("Unable to find user DN: %w", err)
+		}
+		return bindDN, nil
+	}
+
+	// Since the username parses as a valid DN, check that it exists and is
+	// under a configured base DN in the LDAP directory.
+	validDN, isUnderBaseDN, err := l.GetValidatedUserDN(conn, username)
+	if err == nil && !isUnderBaseDN {
+		// Not under any configured base DN, so treat as not found.
+		return nil, nil
+	}
+	return validDN, err
+}
+
+// GetValidatedUserDN validates the given user DN. Will error out if conn is nil. The returned
+// boolean is true iff the user DN is found under one of the LDAP user base DNs.
+func (l *Config) GetValidatedUserDN(conn *ldap.Conn, userDN string) (*xldap.DNSearchResult, bool, error) {
+	return l.GetValidatedDNUnderBaseDN(conn, userDN,
+		l.LDAP.GetUserDNSearchBaseDistNames(), l.LDAP.GetUserDNAttributesList())
+}
+
+// GetValidatedGroupDN validates the given group DN. If conn is nil, creates a
+// connection. The returned boolean is true iff the group DN is found under one
+// of the configured LDAP base DNs.
+func (l *Config) GetValidatedGroupDN(conn *ldap.Conn, groupDN string) (*xldap.DNSearchResult, bool, error) {
+	if conn == nil {
+		var err error
+		conn, err = l.LDAP.Connect()
+		if err != nil {
+			return nil, false, err
+		}
+		defer conn.Close()
+
+		// Bind to the lookup user account
+		if err = l.LDAP.LookupBind(conn); err != nil {
+			return nil, false, err
+		}
+	}
+
+	return l.GetValidatedDNUnderBaseDN(conn, groupDN,
+		l.LDAP.GetGroupSearchBaseDistNames(), nil)
+}
+
+// GetValidatedDNUnderBaseDN checks if the given DN exists in the LDAP
+// directory.
+//
+// The `NormDN` value returned here in the search result may not be equal to the
+// input DN, as LDAP equality is not a simple Golang string equality. However,
+// we assume the value returned by the LDAP server is canonical. Additionally,
+// the attribute type names in the DN are lower-cased.
+//
+// Return values:
+//
+// If the DN is found, the normalized (string) value and any requested
+// attributes are returned and error is nil.
+//
+// If the DN is not found, a nil result and error are returned.
+//
+// The returned boolean is true iff the DN is found under one of the LDAP
+// subtrees listed in `baseDNList`.
+func (l *Config) GetValidatedDNUnderBaseDN(conn *ldap.Conn, dn string, baseDNList []xldap.BaseDNInfo, attrs []string) (*xldap.DNSearchResult, bool, error) {
+	if len(baseDNList) == 0 {
+		return nil, false, errors.New("no Base DNs given")
+	}
+
+	// Check that DN exists in the LDAP directory.
+	searchRes, err := xldap.LookupDN(conn, dn, attrs)
+	if err != nil {
+		return nil, false, fmt.Errorf("Error looking up DN %s: %w", dn, err)
+	}
+	if searchRes == nil {
+		return nil, false, nil
+	}
+
+	// This will not return an error as the argument is validated to be a DN.
+	pdn, _ := ldap.ParseDN(searchRes.NormDN)
+
+	// Check that the DN is under a configured base DN in the LDAP
+	// directory.
+	for _, baseDN := range baseDNList {
+		if baseDN.Parsed.AncestorOf(pdn) {
+			return searchRes, true, nil
+		}
+	}
+
+	// Not under any configured base DN so return false.
+	return searchRes, false, nil
+}
+
+// GetValidatedDNWithGroups - Gets validated DN from given DN or short username
+// and returns the DN and the groups the user is a member of.
+//
+// If username is required in group search but a DN is passed, no groups are
+// returned.
+func (l *Config) GetValidatedDNWithGroups(username string) (*xldap.DNSearchResult, []string, error) {
+	conn, err := l.LDAP.Connect()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer conn.Close()
+
+	// Bind to the lookup user account
+	if err = l.LDAP.LookupBind(conn); err != nil {
+		return nil, nil, err
+	}
+
+	var lookupRes *xldap.DNSearchResult
+	shortUsername := ""
+	// Check if the passed in username is a valid DN.
+	if !l.ParsesAsDN(username) {
+		// We consider it as a login username and attempt to check it exists in
+		// the directory.
+		lookupRes, err = l.LDAP.LookupUsername(conn, username)
+		if err != nil {
+			if strings.Contains(err.Error(), "User DN not found for") {
+				return nil, nil, nil
+			}
+			return nil, nil, fmt.Errorf("Unable to find user DN: %w", err)
+		}
+		shortUsername = username
+	} else {
+		// Since the username parses as a valid DN, check that it exists and is
+		// under a configured base DN in the LDAP directory.
+		var isUnderBaseDN bool
+		lookupRes, isUnderBaseDN, err = l.GetValidatedUserDN(conn, username)
+		if err == nil && !isUnderBaseDN {
+			return nil, nil, fmt.Errorf("Unable to find user DN: %w", err)
+		}
+	}
+
+	groups, err := l.LDAP.SearchForUserGroups(conn, shortUsername, lookupRes.ActualDN)
+	if err != nil {
+		return nil, nil, err
+	}
+	return lookupRes, groups, nil
 }
 
 // Bind - binds to ldap, searches LDAP and returns the distinguished name of the
 // user and the list of groups.
-func (l *Config) Bind(username, password string) (string, []string, error) {
-	conn, err := l.Connect()
+func (l *Config) Bind(username, password string) (*xldap.DNSearchResult, []string, error) {
+	conn, err := l.LDAP.Connect()
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	defer conn.Close()
 
-	var bindDN string
 	// Bind to the lookup user account
-	if err = l.lookupBind(conn); err != nil {
-		return "", nil, err
+	if err = l.LDAP.LookupBind(conn); err != nil {
+		return nil, nil, err
 	}
 
 	// Lookup user DN
-	bindDN, err = l.lookupUserDN(conn, username)
+	lookupResult, err := l.LDAP.LookupUsername(conn, username)
 	if err != nil {
 		errRet := fmt.Errorf("Unable to find user DN: %w", err)
-		return "", nil, errRet
+		return nil, nil, errRet
 	}
 
 	// Authenticate the user credentials.
-	err = conn.Bind(bindDN, password)
+	err = conn.Bind(lookupResult.ActualDN, password)
 	if err != nil {
-		errRet := fmt.Errorf("LDAP auth failed for DN %s: %w", bindDN, err)
-		return "", nil, errRet
+		errRet := fmt.Errorf("LDAP auth failed for DN %s: %w", lookupResult.ActualDN, err)
+		return nil, nil, errRet
 	}
 
 	// Bind to the lookup user account again to perform group search.
-	if err = l.lookupBind(conn); err != nil {
-		return "", nil, err
+	if err = l.LDAP.LookupBind(conn); err != nil {
+		return nil, nil, err
 	}
 
 	// User groups lookup.
-	groups, err := l.searchForUserGroups(conn, username, bindDN)
+	groups, err := l.LDAP.SearchForUserGroups(conn, username, lookupResult.ActualDN)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 
-	return bindDN, groups, nil
-}
-
-// Connect connect to ldap server.
-func (l *Config) Connect() (ldapConn *ldap.Conn, err error) {
-	if l == nil {
-		return nil, errors.New("LDAP is not configured")
-	}
-
-	_, _, err = net.SplitHostPort(l.ServerAddr)
-	if err != nil {
-		// User default LDAP port if none specified "636"
-		l.ServerAddr = net.JoinHostPort(l.ServerAddr, "636")
-	}
-
-	if l.serverInsecure {
-		return ldap.Dial("tcp", l.ServerAddr)
-	}
-
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: l.tlsSkipVerify,
-		RootCAs:            l.rootCAs,
-	}
-
-	if l.serverStartTLS {
-		conn, err := ldap.Dial("tcp", l.ServerAddr)
-		if err != nil {
-			return nil, err
-		}
-		err = conn.StartTLS(tlsConfig)
-		return conn, err
-	}
-
-	return ldap.DialTLS("tcp", l.ServerAddr, tlsConfig)
+	return lookupResult, groups, nil
 }
 
 // GetExpiryDuration - return parsed expiry duration.
@@ -248,10 +288,35 @@ func (l Config) GetExpiryDuration(dsecs string) (time.Duration, error) {
 	return dur, nil
 }
 
+// ParsesAsDN determines if the given string could be a valid DN based on
+// parsing alone.
+func (l Config) ParsesAsDN(dn string) bool {
+	_, err := ldap.ParseDN(dn)
+	return err == nil
+}
+
 // IsLDAPUserDN determines if the given string could be a user DN from LDAP.
 func (l Config) IsLDAPUserDN(user string) bool {
-	for _, baseDN := range l.UserDNSearchBaseDistNames {
-		if strings.HasSuffix(user, ","+baseDN) {
+	udn, err := ldap.ParseDN(user)
+	if err != nil {
+		return false
+	}
+	for _, baseDN := range l.LDAP.GetUserDNSearchBaseDistNames() {
+		if baseDN.Parsed.AncestorOf(udn) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsLDAPGroupDN determines if the given string could be a group DN from LDAP.
+func (l Config) IsLDAPGroupDN(group string) bool {
+	gdn, err := ldap.ParseDN(group)
+	if err != nil {
+		return false
+	}
+	for _, baseDN := range l.LDAP.GetGroupSearchBaseDistNames() {
+		if baseDN.Parsed.AncestorOf(gdn) {
 			return true
 		}
 	}
@@ -261,19 +326,19 @@ func (l Config) IsLDAPUserDN(user string) bool {
 // GetNonEligibleUserDistNames - find user accounts (DNs) that are no longer
 // present in the LDAP server or do not meet filter criteria anymore
 func (l *Config) GetNonEligibleUserDistNames(userDistNames []string) ([]string, error) {
-	conn, err := l.Connect()
+	conn, err := l.LDAP.Connect()
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 
 	// Bind to the lookup user account
-	if err = l.lookupBind(conn); err != nil {
+	if err = l.LDAP.LookupBind(conn); err != nil {
 		return nil, err
 	}
 
-	// Evaluate the filter again with generic wildcard instead of  specific values
-	filter := strings.ReplaceAll(l.UserDNSearchFilter, "%s", "*")
+	// Evaluate the filter again with generic wildcard instead of specific values
+	filter := strings.ReplaceAll(l.LDAP.UserDNSearchFilter, "%s", "*")
 
 	nonExistentUsers := []string{}
 	for _, dn := range userDistNames {
@@ -289,7 +354,11 @@ func (l *Config) GetNonEligibleUserDistNames(userDistNames []string) ([]string, 
 		if err != nil {
 			// Object does not exist error?
 			if ldap.IsErrorWithCode(err, 32) {
-				nonExistentUsers = append(nonExistentUsers, dn)
+				ndn, err := ldap.ParseDN(dn)
+				if err != nil {
+					return nil, err
+				}
+				nonExistentUsers = append(nonExistentUsers, ndn.String())
 				continue
 			}
 			return nil, err
@@ -297,7 +366,11 @@ func (l *Config) GetNonEligibleUserDistNames(userDistNames []string) ([]string, 
 		if len(searchResult.Entries) == 0 {
 			// DN was not found - this means this user account is
 			// expired.
-			nonExistentUsers = append(nonExistentUsers, dn)
+			ndn, err := ldap.ParseDN(dn)
+			if err != nil {
+				return nil, err
+			}
+			nonExistentUsers = append(nonExistentUsers, ndn.String())
 		}
 	}
 	return nonExistentUsers, nil
@@ -306,21 +379,21 @@ func (l *Config) GetNonEligibleUserDistNames(userDistNames []string) ([]string, 
 // LookupGroupMemberships - for each DN finds the set of LDAP groups they are a
 // member of.
 func (l *Config) LookupGroupMemberships(userDistNames []string, userDNToUsernameMap map[string]string) (map[string]set.StringSet, error) {
-	conn, err := l.Connect()
+	conn, err := l.LDAP.Connect()
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 
 	// Bind to the lookup user account
-	if err = l.lookupBind(conn); err != nil {
+	if err = l.LDAP.LookupBind(conn); err != nil {
 		return nil, err
 	}
 
 	res := make(map[string]set.StringSet, len(userDistNames))
 	for _, userDistName := range userDistNames {
 		username := userDNToUsernameMap[userDistName]
-		groups, err := l.searchForUserGroups(conn, username, userDistName)
+		groups, err := l.LDAP.SearchForUserGroups(conn, username, userDistName)
 		if err != nil {
 			return nil, err
 		}
@@ -328,4 +401,22 @@ func (l *Config) LookupGroupMemberships(userDistNames []string, userDNToUsername
 	}
 
 	return res, nil
+}
+
+// QuickNormalizeDN - normalizes the given DN without checking if it is valid or
+// exists in the LDAP directory. Returns input if error
+func (l Config) QuickNormalizeDN(dn string) string {
+	if normDN, err := xldap.NormalizeDN(dn); err == nil {
+		return normDN
+	}
+	return dn
+}
+
+// DecodeDN - denormalizes the given DN by unescaping any escaped characters.
+// Returns input if error
+func (l Config) DecodeDN(dn string) string {
+	if decodedDN, err := xldap.DecodeDN(dn); err == nil {
+		return decodedDN
+	}
+	return dn
 }

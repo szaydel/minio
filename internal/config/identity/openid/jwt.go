@@ -18,7 +18,7 @@
 package openid
 
 import (
-	"crypto"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,15 +30,15 @@ import (
 	jwtgo "github.com/golang-jwt/jwt/v4"
 	"github.com/minio/minio/internal/arn"
 	"github.com/minio/minio/internal/auth"
-	iampolicy "github.com/minio/pkg/iam/policy"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v3/net"
+	"github.com/minio/pkg/v3/policy"
 )
 
 type publicKeys struct {
 	*sync.RWMutex
 
 	// map of kid to public key
-	pkMap map[string]crypto.PublicKey
+	pkMap map[string]interface{}
 }
 
 func (pk *publicKeys) parseAndAdd(b io.Reader) error {
@@ -48,19 +48,25 @@ func (pk *publicKeys) parseAndAdd(b io.Reader) error {
 		return err
 	}
 
-	pk.Lock()
-	defer pk.Unlock()
-
 	for _, key := range jwk.Keys {
-		pk.pkMap[key.Kid], err = key.DecodePublicKey()
+		pkey, err := key.DecodePublicKey()
 		if err != nil {
 			return err
 		}
+		pk.add(key.Kid, pkey)
 	}
+
 	return nil
 }
 
-func (pk *publicKeys) get(kid string) crypto.PublicKey {
+func (pk *publicKeys) add(keyID string, key interface{}) {
+	pk.Lock()
+	defer pk.Unlock()
+
+	pk.pkMap[keyID] = key
+}
+
+func (pk *publicKeys) get(kid string) interface{} {
 	pk.RLock()
 	defer pk.RUnlock()
 	return pk.pkMap[kid]
@@ -72,6 +78,10 @@ func (r *Config) PopulatePublicKey(arn arn.ARN) error {
 	if pCfg.JWKS.URL == nil || pCfg.JWKS.URL.String() == "" {
 		return nil
 	}
+
+	// Add client secret for the client ID for HMAC based signature.
+	r.pubKeys.add(pCfg.ClientID, []byte(pCfg.ClientSecret))
+
 	client := &http.Client{
 		Transport: r.transport,
 	}
@@ -104,8 +114,7 @@ func updateClaimsExpiry(dsecs string, claims map[string]interface{}) error {
 		return nil
 	}
 
-	expAt, err := auth.ExpToInt64(expStr)
-	if err != nil {
+	if _, err := auth.ExpToInt64(expStr); err != nil {
 		return err
 	}
 
@@ -113,13 +122,6 @@ func updateClaimsExpiry(dsecs string, claims map[string]interface{}) error {
 	if err != nil {
 		return err
 	}
-
-	// Verify if JWT expiry is lesser than default expiry duration,
-	// if that is the case then set the default expiration to be
-	// from the JWT expiry claim.
-	if time.Unix(expAt, 0).UTC().Sub(time.Now().UTC()) < defaultExpiryDuration {
-		defaultExpiryDuration = time.Unix(expAt, 0).UTC().Sub(time.Now().UTC())
-	} // else honor the specified expiry duration.
 
 	claims["exp"] = time.Now().UTC().Add(defaultExpiryDuration).Unix() // update with new expiry.
 	return nil
@@ -131,11 +133,14 @@ const (
 )
 
 // Validate - validates the id_token.
-func (r *Config) Validate(arn arn.ARN, token, accessToken, dsecs string) (map[string]interface{}, error) {
+func (r *Config) Validate(ctx context.Context, arn arn.ARN, token, accessToken, dsecs string, claims map[string]interface{}) error {
 	jp := new(jwtgo.Parser)
 	jp.ValidMethods = []string{
-		"RS256", "RS384", "RS512", "ES256", "ES384", "ES512",
-		"RS3256", "RS3384", "RS3512", "ES3256", "ES3384", "ES3512",
+		"RS256", "RS384", "RS512",
+		"ES256", "ES384", "ES512",
+		"HS256", "HS384", "HS512",
+		"RS3256", "RS3384", "RS3512",
+		"ES3256", "ES3384", "ES3512",
 	}
 
 	keyFuncCallback := func(jwtToken *jwtgo.Token) (interface{}, error) {
@@ -148,33 +153,33 @@ func (r *Config) Validate(arn arn.ARN, token, accessToken, dsecs string) (map[st
 
 	pCfg, ok := r.arnProviderCfgsMap[arn]
 	if !ok {
-		return nil, fmt.Errorf("Role %s does not exist", arn)
+		return fmt.Errorf("Role %s does not exist", arn)
 	}
 
-	var claims jwtgo.MapClaims
-	jwtToken, err := jp.ParseWithClaims(token, &claims, keyFuncCallback)
+	mclaims := jwtgo.MapClaims(claims)
+	jwtToken, err := jp.ParseWithClaims(token, &mclaims, keyFuncCallback)
 	if err != nil {
 		// Re-populate the public key in-case the JWKS
 		// pubkeys are refreshed
 		if err = r.PopulatePublicKey(arn); err != nil {
-			return nil, err
+			return err
 		}
-		jwtToken, err = jwtgo.ParseWithClaims(token, &claims, keyFuncCallback)
+		jwtToken, err = jwtgo.ParseWithClaims(token, &mclaims, keyFuncCallback)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
 	if !jwtToken.Valid {
-		return nil, ErrTokenExpired
+		return ErrTokenExpired
 	}
 
-	if err = updateClaimsExpiry(dsecs, claims); err != nil {
-		return nil, err
+	if err = updateClaimsExpiry(dsecs, mclaims); err != nil {
+		return err
 	}
 
-	if err = r.updateUserinfoClaims(arn, accessToken, claims); err != nil {
-		return nil, err
+	if err = r.updateUserinfoClaims(ctx, arn, accessToken, mclaims); err != nil {
+		return err
 	}
 
 	// Validate that matching clientID appears in the aud or azp claims.
@@ -186,9 +191,9 @@ func (r *Config) Validate(arn arn.ARN, token, accessToken, dsecs string) (map[st
 	// array of case sensitive strings. In the common special case
 	// when there is one audience, the aud value MAY be a single
 	// case sensitive
-	audValues, ok := iampolicy.GetValuesFromClaims(claims, audClaim)
+	audValues, ok := policy.GetValuesFromClaims(mclaims, audClaim)
 	if !ok {
-		return nil, errors.New("STS JWT Token has `aud` claim invalid, `aud` must match configured OpenID Client ID")
+		return errors.New("STS JWT Token has `aud` claim invalid, `aud` must match configured OpenID Client ID")
 	}
 	if !audValues.Contains(pCfg.ClientID) {
 		// if audience claims is missing, look for "azp" claims.
@@ -200,19 +205,19 @@ func (r *Config) Validate(arn arn.ARN, token, accessToken, dsecs string) (map[st
 		// be included even when the authorized party is the same
 		// as the sole audience. The azp value is a case sensitive
 		// string containing a StringOrURI value
-		azpValues, ok := iampolicy.GetValuesFromClaims(claims, azpClaim)
+		azpValues, ok := policy.GetValuesFromClaims(mclaims, azpClaim)
 		if !ok {
-			return nil, errors.New("STS JWT Token has `azp` claim invalid, `azp` must match configured OpenID Client ID")
+			return errors.New("STS JWT Token has `azp` claim invalid, `azp` must match configured OpenID Client ID")
 		}
 		if !azpValues.Contains(pCfg.ClientID) {
-			return nil, errors.New("STS JWT Token has `azp` claim invalid, `azp` must match configured OpenID Client ID")
+			return errors.New("STS JWT Token has `azp` claim invalid, `azp` must match configured OpenID Client ID")
 		}
 	}
 
-	return claims, nil
+	return nil
 }
 
-func (r *Config) updateUserinfoClaims(arn arn.ARN, accessToken string, claims map[string]interface{}) error {
+func (r *Config) updateUserinfoClaims(ctx context.Context, arn arn.ARN, accessToken string, claims map[string]interface{}) error {
 	pCfg, ok := r.arnProviderCfgsMap[arn]
 	// If claim user info is enabled, get claims from userInfo
 	// and overwrite them with the claims from JWT.
@@ -220,7 +225,7 @@ func (r *Config) updateUserinfoClaims(arn arn.ARN, accessToken string, claims ma
 		if accessToken == "" {
 			return errors.New("access_token is mandatory if user_info claim is enabled")
 		}
-		uclaims, err := pCfg.UserInfo(accessToken, r.transport)
+		uclaims, err := pCfg.UserInfo(ctx, accessToken, r.transport)
 		if err != nil {
 			return err
 		}
@@ -239,6 +244,7 @@ type DiscoveryDoc struct {
 	Issuer                           string   `json:"issuer,omitempty"`
 	AuthEndpoint                     string   `json:"authorization_endpoint,omitempty"`
 	TokenEndpoint                    string   `json:"token_endpoint,omitempty"`
+	EndSessionEndpoint               string   `json:"end_session_endpoint,omitempty"`
 	UserInfoEndpoint                 string   `json:"userinfo_endpoint,omitempty"`
 	RevocationEndpoint               string   `json:"revocation_endpoint,omitempty"`
 	JwksURI                          string   `json:"jwks_uri,omitempty"`
@@ -266,7 +272,7 @@ func parseDiscoveryDoc(u *xnet.URL, transport http.RoundTripper, closeRespFn fun
 	}
 	defer closeRespFn(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return d, err
+		return d, fmt.Errorf("unexpected error returned by %s : status(%s)", u, resp.Status)
 	}
 	dec := json.NewDecoder(resp.Body)
 	if err = dec.Decode(&d); err != nil {

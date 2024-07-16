@@ -25,12 +25,12 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/gorilla/mux"
-	"github.com/minio/kes"
-	"github.com/minio/madmin-go"
+	"github.com/minio/kms-go/kes"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/mux"
+	"github.com/minio/pkg/v3/policy"
 )
 
 const (
@@ -51,11 +51,6 @@ func (api objectAPIHandlers) PutBucketEncryptionHandler(w http.ResponseWriter, r
 		return
 	}
 
-	if !objAPI.IsEncryptionSupported() {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
-		return
-	}
-
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 
@@ -65,7 +60,7 @@ func (api objectAPIHandlers) PutBucketEncryptionHandler(w http.ResponseWriter, r
 	}
 
 	// Check if bucket exists.
-	if _, err := objAPI.GetBucketInfo(ctx, bucket); err != nil {
+	if _, err := objAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -90,7 +85,7 @@ func (api objectAPIHandlers) PutBucketEncryptionHandler(w http.ResponseWriter, r
 	kmsKey := encConfig.KeyID()
 	if kmsKey != "" {
 		kmsContext := kms.Context{"MinIO admin API": "ServerInfoHandler"} // Context for a test key operation
-		_, err := GlobalKMS.GenerateKey(kmsKey, kmsContext)
+		_, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{Name: kmsKey, AssociatedData: kmsContext})
 		if err != nil {
 			if errors.Is(err, kes.ErrKeyNotFound) {
 				writeErrorResponse(ctx, w, toAPIError(ctx, errKMSKeyNotFound), r.URL)
@@ -119,15 +114,12 @@ func (api objectAPIHandlers) PutBucketEncryptionHandler(w http.ResponseWriter, r
 	// We encode the xml bytes as base64 to ensure there are no encoding
 	// errors.
 	cfgStr := base64.StdEncoding.EncodeToString(configData)
-	if err = globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
+	replLogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
 		Type:      madmin.SRBucketMetaTypeSSEConfig,
 		Bucket:    bucket,
 		SSEConfig: &cfgStr,
 		UpdatedAt: updatedAt,
-	}); err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-		return
-	}
+	}))
 
 	writeSuccessResponseHeadersOnly(w)
 }
@@ -155,7 +147,7 @@ func (api objectAPIHandlers) GetBucketEncryptionHandler(w http.ResponseWriter, r
 
 	// Check if bucket exists
 	var err error
-	if _, err = objAPI.GetBucketInfo(ctx, bucket); err != nil {
+	if _, err = objAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -198,27 +190,25 @@ func (api objectAPIHandlers) DeleteBucketEncryptionHandler(w http.ResponseWriter
 
 	// Check if bucket exists
 	var err error
-	if _, err = objAPI.GetBucketInfo(ctx, bucket); err != nil {
+	if _, err = objAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
 	// Delete bucket encryption config from object layer
-	updatedAt, err := globalBucketMetadataSys.Update(ctx, bucket, bucketSSEConfig, nil)
+	updatedAt, err := globalBucketMetadataSys.Delete(ctx, bucket, bucketSSEConfig)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
+
 	// Call site replication hook.
-	//
-	if err = globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
+	replLogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
 		Type:      madmin.SRBucketMetaTypeSSEConfig,
 		Bucket:    bucket,
 		SSEConfig: nil,
 		UpdatedAt: updatedAt,
-	}); err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-		return
-	}
+	}))
+
 	writeSuccessNoContent(w)
 }

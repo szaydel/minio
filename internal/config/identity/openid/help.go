@@ -27,13 +27,6 @@ var (
 
 	Help = config.HelpKVS{
 		config.HelpKV{
-			Key:         config.Enable,
-			Description: "Enable or disable OpenID",
-			Type:        "on|off",
-			Optional:    true,
-			Sensitive:   false,
-		},
-		config.HelpKV{
 			Key:         DisplayName,
 			Description: "Friendly display name for this Provider/App" + defaultHelpPostfix(DisplayName),
 			Optional:    true,
@@ -52,7 +45,9 @@ var (
 		config.HelpKV{
 			Key:         ClientSecret,
 			Description: `secret for the unique public identifier for apps` + defaultHelpPostfix(ClientSecret),
+			Sensitive:   true,
 			Type:        "string",
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         RolePolicy,

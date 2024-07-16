@@ -20,8 +20,6 @@ package lifecycle
 import (
 	"bytes"
 	"encoding/xml"
-
-	"github.com/google/uuid"
 )
 
 // Status represents lifecycle configuration status
@@ -35,46 +33,29 @@ const (
 
 // Rule - a rule for lifecycle configuration.
 type Rule struct {
-	XMLName    xml.Name   `xml:"Rule"`
-	ID         string     `xml:"ID,omitempty"`
-	Status     Status     `xml:"Status"`
-	Filter     Filter     `xml:"Filter,omitempty"`
-	Prefix     Prefix     `xml:"Prefix,omitempty"`
-	Expiration Expiration `xml:"Expiration,omitempty"`
-	Transition Transition `xml:"Transition,omitempty"`
+	XMLName             xml.Name            `xml:"Rule"`
+	ID                  string              `xml:"ID,omitempty"`
+	Status              Status              `xml:"Status"`
+	Filter              Filter              `xml:"Filter,omitempty"`
+	Prefix              Prefix              `xml:"Prefix,omitempty"`
+	Expiration          Expiration          `xml:"Expiration,omitempty"`
+	Transition          Transition          `xml:"Transition,omitempty"`
+	DelMarkerExpiration DelMarkerExpiration `xml:"DelMarkerExpiration,omitempty"`
 	// FIXME: add a type to catch unsupported AbortIncompleteMultipartUpload AbortIncompleteMultipartUpload `xml:"AbortIncompleteMultipartUpload,omitempty"`
 	NoncurrentVersionExpiration NoncurrentVersionExpiration `xml:"NoncurrentVersionExpiration,omitempty"`
 	NoncurrentVersionTransition NoncurrentVersionTransition `xml:"NoncurrentVersionTransition,omitempty"`
 }
 
 var (
-	errInvalidRuleID     = Errorf("ID length is limited to 255 characters")
-	errEmptyRuleStatus   = Errorf("Status should not be empty")
-	errInvalidRuleStatus = Errorf("Status must be set to either Enabled or Disabled")
+	errInvalidRuleID                  = Errorf("ID length is limited to 255 characters")
+	errEmptyRuleStatus                = Errorf("Status should not be empty")
+	errInvalidRuleStatus              = Errorf("Status must be set to either Enabled or Disabled")
+	errInvalidRuleDelMarkerExpiration = Errorf("Rule with DelMarkerExpiration cannot have tags based filtering")
 )
-
-// generates random UUID
-func getNewUUID() (string, error) {
-	u, err := uuid.NewRandom()
-	if err != nil {
-		return "", err
-	}
-
-	return u.String(), nil
-}
 
 // validateID - checks if ID is valid or not.
 func (r Rule) validateID() error {
-	IDLen := len(r.ID)
-	// generate new ID when not provided
-	// cannot be longer than 255 characters
-	if IDLen == 0 {
-		if newID, err := getNewUUID(); err == nil {
-			r.ID = newID
-		} else {
-			return err
-		}
-	} else if IDLen > 255 {
+	if len(r.ID) > 255 {
 		return errInvalidRuleID
 	}
 	return nil
@@ -179,8 +160,24 @@ func (r Rule) Validate() error {
 	if err := r.validateNoncurrentTransition(); err != nil {
 		return err
 	}
-	if !r.Expiration.set && !r.Transition.set && !r.NoncurrentVersionExpiration.set && !r.NoncurrentVersionTransition.set {
+	if (!r.Filter.Tag.IsEmpty() || len(r.Filter.And.Tags) != 0) && !r.DelMarkerExpiration.Empty() {
+		return errInvalidRuleDelMarkerExpiration
+	}
+	if !r.Expiration.set && !r.Transition.set && !r.NoncurrentVersionExpiration.set && !r.NoncurrentVersionTransition.set && r.DelMarkerExpiration.Empty() {
 		return errXMLNotWellFormed
 	}
 	return nil
+}
+
+// CloneNonTransition - returns a clone of the object containing non transition rules
+func (r Rule) CloneNonTransition() Rule {
+	return Rule{
+		XMLName:                     r.XMLName,
+		ID:                          r.ID,
+		Status:                      r.Status,
+		Filter:                      r.Filter,
+		Prefix:                      r.Prefix,
+		Expiration:                  r.Expiration,
+		NoncurrentVersionExpiration: r.NoncurrentVersionExpiration,
+	}
 }

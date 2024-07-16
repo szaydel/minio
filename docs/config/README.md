@@ -6,7 +6,7 @@ MinIO stores all its config as part of the server deployment, config is erasure 
 
 ### Certificate Directory
 
-TLS certificates by default are expected to be stored under ``${HOME}/.minio/certs`` directory. You need to place certificates here to enable `HTTPS` based access. Read more about [How to secure access to MinIO server with TLS](https://docs.min.io/docs/how-to-secure-access-to-minio-server-with-tls).
+TLS certificates by default are expected to be stored under ``${HOME}/.minio/certs`` directory. You need to place certificates here to enable `HTTPS` based access. Read more about [How to secure access to MinIO server with TLS](https://min.io/docs/minio/linux/operations/network-encryption.html).
 
 Following is a sample directory structure for MinIO server with TLS certificates.
 
@@ -89,38 +89,6 @@ MINIO_STORAGE_CLASS_RRS       (string)    set the parity count for reduced redun
 MINIO_STORAGE_CLASS_COMMENT   (sentence)  optionally add a comment to this setting
 ```
 
-### Cache
-
-MinIO provides caching storage tier for primarily gateway deployments, allowing you to cache content for faster reads, cost savings on repeated downloads from the cloud.
-
-```
-KEY:
-cache  add caching storage tier
-
-ARGS:
-drives*  (csv)       comma separated mountpoints e.g. "/optane1,/optane2"
-expiry   (number)    cache expiry duration in days e.g. "90"
-quota    (number)    limit cache drive usage in percentage e.g. "90"
-exclude  (csv)       comma separated wildcard exclusion patterns e.g. "bucket/*.tmp,*.exe"
-after    (number)    minimum number of access before caching an object
-comment  (sentence)  optionally add a comment to this setting
-```
-
-or environment variables
-
-```
-KEY:
-cache  add caching storage tier
-
-ARGS:
-MINIO_CACHE_DRIVES*  (csv)       comma separated mountpoints e.g. "/optane1,/optane2"
-MINIO_CACHE_EXPIRY   (number)    cache expiry duration in days e.g. "90"
-MINIO_CACHE_QUOTA    (number)    limit cache drive usage in percentage e.g. "90"
-MINIO_CACHE_EXCLUDE  (csv)       comma separated wildcard exclusion patterns e.g. "bucket/*.tmp,*.exe"
-MINIO_CACHE_AFTER    (number)    minimum number of access before caching an object
-MINIO_CACHE_COMMENT  (sentence)  optionally add a comment to this setting
-```
-
 #### Etcd
 
 MinIO supports storing encrypted IAM assets in etcd, if KMS is configured. Please refer to how to encrypt your config and IAM credentials [here](https://github.com/minio/minio/blob/master/docs/kms/IAM.md).
@@ -164,24 +132,44 @@ KEY:
 api  manage global HTTP API call specific features, such as throttling, authentication types, etc.
 
 ARGS:
-requests_max               (number)    set the maximum number of concurrent requests, e.g. "1600"
-requests_deadline          (duration)  set the deadline for API requests waiting to be processed e.g. "1m"
-cors_allow_origin          (csv)       set comma separated list of origins allowed for CORS requests e.g. "https://example1.com,https://example2.com"
-remote_transport_deadline  (duration)  set the deadline for API requests on remote transports while proxying between federated instances e.g. "2h"
+requests_max                    (number)    set the maximum number of concurrent requests (default: '0')
+requests_deadline               (duration)  set the deadline for API requests waiting to be processed (default: '10s')
+cluster_deadline                (duration)  set the deadline for cluster readiness check (default: '10s')
+cors_allow_origin               (csv)       set comma separated list of origins allowed for CORS requests (default: '*')
+remote_transport_deadline       (duration)  set the deadline for API requests on remote transports while proxying between federated instances e.g. "2h" (default: '2h')
+list_quorum                     (string)    set the acceptable quorum expected for list operations e.g. "optimal", "reduced", "disk", "strict" (default: 'strict')
+replication_priority            (string)    set replication priority (default: 'auto')
+transition_workers              (number)    set the number of transition workers (default: '100')
+stale_uploads_expiry            (duration)  set to expire stale multipart uploads older than this values (default: '24h')
+stale_uploads_cleanup_interval  (duration)  set to change intervals when stale multipart uploads are expired (default: '6h')
+delete_cleanup_interval         (duration)  set to change intervals when deleted objects are permanently deleted from ".trash" folder (default: '5m')
+odirect                         (boolean)   set to enable or disable O_DIRECT for read and writes under special conditions. NOTE: do not disable O_DIRECT without prior testing (default: 'on')
+root_access                     (boolean)   turn 'off' root credential access for all API calls including s3, admin operations (default: 'on')
+sync_events                     (boolean)   set to enable synchronous bucket notifications (default: 'off')
 ```
 
 or environment variables
 
 ```
-MINIO_API_REQUESTS_MAX               (number)    set the maximum number of concurrent requests, e.g. "1600"
-MINIO_API_REQUESTS_DEADLINE          (duration)  set the deadline for API requests waiting to be processed e.g. "1m"
-MINIO_API_CORS_ALLOW_ORIGIN          (csv)       set comma separated list of origins allowed for CORS requests e.g. "https://example1.com,https://example2.com"
-MINIO_API_REMOTE_TRANSPORT_DEADLINE  (duration)  set the deadline for API requests on remote transports while proxying between federated instances e.g. "2h"
+MINIO_API_REQUESTS_MAX                    (number)    set the maximum number of concurrent requests (default: '0')
+MINIO_API_REQUESTS_DEADLINE               (duration)  set the deadline for API requests waiting to be processed (default: '10s')
+MINIO_API_CLUSTER_DEADLINE                (duration)  set the deadline for cluster readiness check (default: '10s')
+MINIO_API_CORS_ALLOW_ORIGIN               (csv)       set comma separated list of origins allowed for CORS requests (default: '*')
+MINIO_API_REMOTE_TRANSPORT_DEADLINE       (duration)  set the deadline for API requests on remote transports while proxying between federated instances e.g. "2h" (default: '2h')
+MINIO_API_LIST_QUORUM                     (string)    set the acceptable quorum expected for list operations e.g. "optimal", "reduced", "disk", "strict" (default: 'strict')
+MINIO_API_REPLICATION_PRIORITY            (string)    set replication priority (default: 'auto')
+MINIO_API_TRANSITION_WORKERS              (number)    set the number of transition workers (default: '100')
+MINIO_API_STALE_UPLOADS_EXPIRY            (duration)  set to expire stale multipart uploads older than this values (default: '24h')
+MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL  (duration)  set to change intervals when stale multipart uploads are expired (default: '6h')
+MINIO_API_DELETE_CLEANUP_INTERVAL         (duration)  set to change intervals when deleted objects are permanently deleted from ".trash" folder (default: '5m')
+MINIO_API_ODIRECT                         (boolean)   set to enable or disable O_DIRECT for read and writes under special conditions. NOTE: do not disable O_DIRECT without prior testing (default: 'on')
+MINIO_API_ROOT_ACCESS                     (boolean)   turn 'off' root credential access for all API calls including s3, admin operations (default: 'on')
+MINIO_API_SYNC_EVENTS                     (boolean)   set to enable synchronous bucket notifications (default: 'off')
 ```
 
 #### Notifications
 
-Notification targets supported by MinIO are in the following list. To configure individual targets please refer to more detailed documentation [here](https://docs.min.io/docs/minio-bucket-notification-guide.html).
+Notification targets supported by MinIO are in the following list. To configure individual targets please refer to more detailed documentation [here](https://min.io/docs/minio/linux/administration/monitoring.html#bucket-notifications).
 
 ```
 notify_webhook        publish bucket notifications to webhook endpoints
@@ -272,6 +260,7 @@ scanner  manage namespace scanning for usage calculation, lifecycle, healing and
 ARGS:
 delay     (float)     scanner delay multiplier, defaults to '10.0'
 max_wait  (duration)  maximum wait time between operations, defaults to '15s'
+cycle     (duration)  time duration between scanner cycles
 ```
 
 Example: the following setting will decrease the scanner speed by a factor of 3, reducing the system resource use, but increasing the latency of updates being reflected.
@@ -282,13 +271,14 @@ Example: the following setting will decrease the scanner speed by a factor of 3,
 
 Once set the scanner settings are automatically applied without the need for server restarts.
 
-> NOTE: Data usage scanner is not supported under Gateway deployments.
-
 ### Healing
 
-Healing is enabled by default. The following configuration settings allow for more staggered delay in terms of healing. The healing system by default adapts to the system speed and pauses up to '1sec' per object when the system has `max_io` number of concurrent requests. It is possible to adjust the `max_sleep` and `max_io` values thereby increasing the healing speed. The delays between each operation of the healer can be adjusted by the `mc admin config set alias/ heal max_sleep=1s` and maximum concurrent requests allowed before we start slowing things down can be configured with `mc admin config set alias/ heal max_io=30` . By default the wait delay is `1sec` beyond 10 concurrent operations. This means the healer will sleep *1 second* at max for each heal operation if there are more than *10* concurrent client requests.
+Healing is enabled by default. The following configuration settings allow for more staggered delay in terms of healing. The healing system by default adapts to the system speed and pauses up to '250ms' per object when the system has `max_io` number of concurrent requests. It is possible to adjust the `max_sleep` and `max_io` values thereby increasing the healing speed. The delays between each operation of the healer can be adjusted by the `mc admin config set alias/ heal max_sleep=1s` and maximum concurrent requests allowed before we start slowing things down can be configured with `mc admin config set alias/ heal max_io=30` . By default the wait delay is `250ms` beyond 100 concurrent operations. This means the healer will sleep *250 milliseconds* at max for each heal operation if there are more than *100* concurrent client requests.
 
 In most setups this is sufficient to heal the content after drive replacements. Setting `max_sleep` to a *lower* value and setting `max_io` to a *higher* value would make heal go faster.
+
+Each node is responsible of healing its local drives; Each drive will have multiple heal workers which is the quarter of the number of CPU cores of the node or the quarter of the configured nr_requests of the drive (https://www.kernel.org/doc/Documentation/block/queue-sysfs.txt). It is also possible to provide a custom number of workers by using this command: `mc admin config set alias/ heal drive_workers=100` .
+
 
 ```
 ~ mc admin config set alias/ heal
@@ -296,9 +286,10 @@ KEY:
 heal  manage object healing frequency and bitrot verification checks
 
 ARGS:
-bitrotscan  (on|off)    perform bitrot scan on disks when checking objects during scanner
-max_sleep   (duration)  maximum sleep duration between objects to slow down heal operation. eg. 2s
-max_io      (int)       maximum IO requests allowed between objects to slow down heal operation. eg. 3
+bitrotscan     (on|off)    perform bitrot scan on drives when checking objects during scanner
+max_sleep      (duration)  maximum sleep duration between objects to slow down heal operation. eg. 2s
+max_io         (int)       maximum IO requests allowed between objects to slow down heal operation. eg. 3
+drive_workers  (int)       the number of workers per drive to heal a new disk replacement.
 ```
 
 Example: The following settings will increase the heal operation speed by allowing healing operation to run without delay up to `100` concurrent requests, and the maximum delay between each heal operation is set to `300ms`.
@@ -308,8 +299,6 @@ Example: The following settings will increase the heal operation speed by allowi
 ```
 
 Once set the healer settings are automatically applied without the need for server restarts.
-
-> NOTE: Healing is not supported for Gateway deployments.
 
 ## Environment only settings (not in config)
 
@@ -344,5 +333,5 @@ minio server /data
 
 ## Explore Further
 
-* [MinIO Quickstart Guide](https://docs.min.io/docs/minio-quickstart-guide)
-* [Configure MinIO Server with TLS](https://docs.min.io/docs/how-to-secure-access-to-minio-server-with-tls)
+* [MinIO Quickstart Guide](https://min.io/docs/minio/linux/index.html#quickstart-for-linux)
+* [Configure MinIO Server with TLS](https://min.io/docs/minio/linux/operations/network-encryption.html)

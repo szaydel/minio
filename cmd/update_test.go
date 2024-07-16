@@ -20,7 +20,6 @@ package cmd
 import (
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -72,6 +71,14 @@ func TestReleaseTagToNFromTimeConversion(t *testing.T) {
 			time.Now().UTC(), "DEVELOPMENT.GOGET",
 			"DEVELOPMENT.GOGET is not a valid release tag",
 		},
+		{
+			time.Date(2017, time.August, 5, 0, 0, 53, 0, utcLoc),
+			"RELEASE.2017-08-05T00-00-53Z.hotfix", "",
+		},
+		{
+			time.Date(2017, time.August, 5, 0, 0, 53, 0, utcLoc),
+			"RELEASE.2017-08-05T00-00-53Z.hotfix.aaaa", "",
+		},
 	}
 	for i, testCase := range testCases {
 		if testCase.errStr != "" {
@@ -91,12 +98,6 @@ func TestReleaseTagToNFromTimeConversion(t *testing.T) {
 }
 
 func TestDownloadURL(t *testing.T) {
-	sci := globalIsCICD
-	globalIsCICD = false
-	defer func() {
-		globalIsCICD = sci
-	}()
-
 	minioVersion1 := releaseTimeToReleaseTag(UTCNow())
 	durl := getDownloadURL(minioVersion1)
 	if IsDocker() {
@@ -105,12 +106,12 @@ func TestDownloadURL(t *testing.T) {
 		}
 	} else {
 		if runtime.GOOS == "windows" {
-			if durl != minioReleaseURL+"minio.exe" {
-				t.Errorf("Expected %s, got %s", minioReleaseURL+"minio.exe", durl)
+			if durl != MinioReleaseURL+"minio.exe" {
+				t.Errorf("Expected %s, got %s", MinioReleaseURL+"minio.exe", durl)
 			}
 		} else {
-			if durl != minioReleaseURL+"minio" {
-				t.Errorf("Expected %s, got %s", minioReleaseURL+"minio", durl)
+			if durl != MinioReleaseURL+"minio" {
+				t.Errorf("Expected %s, got %s", MinioReleaseURL+"minio", durl)
 			}
 		}
 	}
@@ -140,26 +141,23 @@ func TestUserAgent(t *testing.T) {
 			envName:     "",
 			envValue:    "",
 			mode:        globalMinioModeFS,
-			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; source) MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET", runtime.GOOS, runtime.GOARCH, globalMinioModeFS),
+			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; source DEVELOPMENT.GOGET DEVELOPMENT.GOGET DEVELOPMENT.GOGET", runtime.GOOS, runtime.GOARCH, globalMinioModeFS),
 		},
 		{
 			envName:     "MESOS_CONTAINER_NAME",
 			envValue:    "mesos-11111",
 			mode:        globalMinioModeErasure,
-			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; %s; source) MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET MinIO/universe-%s", runtime.GOOS, runtime.GOARCH, globalMinioModeErasure, "dcos", "mesos-1111"),
+			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; %s; source DEVELOPMENT.GOGET DEVELOPMENT.GOGET DEVELOPMENT.GOGET universe-%s", runtime.GOOS, runtime.GOARCH, globalMinioModeErasure, "dcos", "mesos-1111"),
 		},
 		{
 			envName:     "KUBERNETES_SERVICE_HOST",
 			envValue:    "10.11.148.5",
 			mode:        globalMinioModeErasure,
-			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; %s; source) MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET", runtime.GOOS, runtime.GOARCH, globalMinioModeErasure, "kubernetes"),
+			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; %s; source DEVELOPMENT.GOGET DEVELOPMENT.GOGET DEVELOPMENT.GOGET", runtime.GOOS, runtime.GOARCH, globalMinioModeErasure, "kubernetes"),
 		},
 	}
 
 	for i, testCase := range testCases {
-		sci := globalIsCICD
-		globalIsCICD = false
-
 		if testCase.envName != "" {
 			t.Setenv(testCase.envName, testCase.envValue)
 			if testCase.envName == "MESOS_CONTAINER_NAME" {
@@ -172,10 +170,9 @@ func TestUserAgent(t *testing.T) {
 		if IsDocker() {
 			expectedStr = strings.ReplaceAll(expectedStr, "; source", "; docker; source")
 		}
-		if str != expectedStr {
+		if !strings.Contains(str, expectedStr) {
 			t.Errorf("Test %d: expected: %s, got: %s", i+1, expectedStr, str)
 		}
-		globalIsCICD = sci
 		os.Unsetenv("MARATHON_APP_LABEL_DCOS_PACKAGE_VERSION")
 		os.Unsetenv(testCase.envName)
 	}
@@ -183,12 +180,6 @@ func TestUserAgent(t *testing.T) {
 
 // Tests if the environment we are running is in DCOS.
 func TestIsDCOS(t *testing.T) {
-	sci := globalIsCICD
-	globalIsCICD = false
-	defer func() {
-		globalIsCICD = sci
-	}()
-
 	t.Setenv("MESOS_CONTAINER_NAME", "mesos-1111")
 	dcos := IsDCOS()
 	if !dcos {
@@ -203,12 +194,6 @@ func TestIsDCOS(t *testing.T) {
 
 // Tests if the environment we are running is in kubernetes.
 func TestIsKubernetes(t *testing.T) {
-	sci := globalIsCICD
-	globalIsCICD = false
-	defer func() {
-		globalIsCICD = sci
-	}()
-
 	t.Setenv("KUBERNETES_SERVICE_HOST", "10.11.148.5")
 	kubernetes := IsKubernetes()
 	if !kubernetes {
@@ -225,7 +210,7 @@ func TestIsKubernetes(t *testing.T) {
 // Tests if the environment we are running is Helm chart.
 func TestGetHelmVersion(t *testing.T) {
 	createTempFile := func(content string) string {
-		tmpfile, err := ioutil.TempFile("", "helm-testfile-")
+		tmpfile, err := os.CreateTemp("", "helm-testfile-")
 		if err != nil {
 			t.Fatalf("Unable to create temporary file. %s", err)
 		}
@@ -293,13 +278,14 @@ func TestDownloadReleaseData(t *testing.T) {
 		}
 
 		result, err := downloadReleaseURL(u, 1*time.Second, "")
-		if testCase.expectedErr == nil {
+		switch {
+		case testCase.expectedErr == nil:
 			if err != nil {
 				t.Fatalf("error: expected: %v, got: %v", testCase.expectedErr, err)
 			}
-		} else if err == nil {
+		case err == nil:
 			t.Fatalf("error: expected: %v, got: %v", testCase.expectedErr, err)
-		} else if testCase.expectedErr.Error() != err.Error() {
+		case testCase.expectedErr.Error() != err.Error():
 			t.Fatalf("error: expected: %v, got: %v", testCase.expectedErr, err)
 		}
 

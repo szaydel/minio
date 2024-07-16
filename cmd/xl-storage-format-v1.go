@@ -26,7 +26,6 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	jsoniter "github.com/json-iterator/go"
-	"github.com/minio/minio/internal/logger"
 )
 
 // XL constants.
@@ -106,6 +105,38 @@ type ErasureInfo struct {
 	Checksums []ChecksumInfo `json:"checksum,omitempty"`
 }
 
+// Equal equates current erasure info with newer erasure info.
+// returns false if one of the following check fails
+// - erasure algorithm is different
+// - data blocks are different
+// - parity blocks are different
+// - block size is different
+// - distribution array size is different
+// - distribution indexes are different
+func (ei ErasureInfo) Equal(nei ErasureInfo) bool {
+	if ei.Algorithm != nei.Algorithm {
+		return false
+	}
+	if ei.DataBlocks != nei.DataBlocks {
+		return false
+	}
+	if ei.ParityBlocks != nei.ParityBlocks {
+		return false
+	}
+	if ei.BlockSize != nei.BlockSize {
+		return false
+	}
+	if len(ei.Distribution) != len(nei.Distribution) {
+		return false
+	}
+	for i, ecindex := range ei.Distribution {
+		if ecindex != nei.Distribution[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // BitrotAlgorithm specifies a algorithm used for bitrot protection.
 type BitrotAlgorithm uint
 
@@ -128,10 +159,13 @@ const (
 // ObjectPartInfo Info of each part kept in the multipart metadata
 // file after CompleteMultipartUpload() is called.
 type ObjectPartInfo struct {
-	ETag       string `json:"etag,omitempty"`
-	Number     int    `json:"number"`
-	Size       int64  `json:"size"`
-	ActualSize int64  `json:"actualSize"`
+	ETag       string            `json:"etag,omitempty"`
+	Number     int               `json:"number"`
+	Size       int64             `json:"size"`       // Size of the part on the disk.
+	ActualSize int64             `json:"actualSize"` // Original size of the part without compression or encryption bytes.
+	ModTime    time.Time         `json:"modTime"`    // Date and time at which the part was uploaded.
+	Index      []byte            `json:"index,omitempty" msg:"index,omitempty"`
+	Checksums  map[string]string `json:"crc,omitempty" msg:"crc,omitempty"` // Content Checksums
 }
 
 // ChecksumInfo - carries checksums of individual scattered parts per disk.
@@ -175,7 +209,7 @@ func (c *ChecksumInfo) UnmarshalJSON(data []byte) error {
 	}
 
 	if !c.Algorithm.Available() {
-		logger.LogIf(GlobalContext, errBitrotHashAlgoInvalid)
+		internalLogIf(GlobalContext, errBitrotHashAlgoInvalid)
 		return errBitrotHashAlgoInvalid
 	}
 	return nil

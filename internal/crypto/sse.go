@@ -43,9 +43,9 @@ const (
 )
 
 // Type represents an AWS SSE type:
-//  • SSE-C
-//  • SSE-S3
-//  • SSE-KMS
+//   - SSE-C
+//   - SSE-S3
+//   - SSE-KMS
 type Type interface {
 	fmt.Stringer
 
@@ -71,6 +71,11 @@ func IsRequested(h http.Header) (Type, bool) {
 	}
 }
 
+// Requested returns whether any type of encryption is requested.
+func Requested(h http.Header) bool {
+	return S3.IsRequested(h) || S3KMS.IsRequested(h) || SSEC.IsRequested(h)
+}
+
 // UnsealObjectKey extracts and decrypts the sealed object key
 // from the metadata using the SSE-Copy client key of the HTTP headers
 // and returns the decrypted object key.
@@ -94,7 +99,7 @@ func unsealObjectKey(clientKey []byte, metadata map[string]string, bucket, objec
 }
 
 // EncryptSinglePart encrypts an io.Reader which must be the
-// the body of a single-part PUT request.
+// body of a single-part PUT request.
 func EncryptSinglePart(r io.Reader, key ObjectKey) io.Reader {
 	r, err := sio.EncryptReader(r, sio.Config{MinVersion: sio.Version20, Key: key[:], CipherSuites: fips.DARECiphers()})
 	if err != nil {

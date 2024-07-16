@@ -84,7 +84,7 @@ func TestParseLegalHoldStatus(t *testing.T) {
 }
 
 // TestUnmarshalDefaultRetention checks if default retention
-// marshaling and unmarshaling work as expected
+// marshaling and unmarshalling work as expected
 func TestUnmarshalDefaultRetention(t *testing.T) {
 	days := uint64(4)
 	years := uint64(1)
@@ -174,17 +174,20 @@ func TestParseObjectLockConfig(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		_, err := ParseObjectLockConfig(strings.NewReader(tt.value))
-		//nolint:gocritic
-		if tt.expectedErr == nil {
-			if err != nil {
-				t.Fatalf("error: expected = <nil>, got = %v", err)
+		tt := tt
+		t.Run("", func(t *testing.T) {
+			_, err := ParseObjectLockConfig(strings.NewReader(tt.value))
+			//nolint:gocritic
+			if tt.expectedErr == nil {
+				if err != nil {
+					t.Fatalf("error: expected = <nil>, got = %v", err)
+				}
+			} else if err == nil {
+				t.Fatalf("error: expected = %v, got = <nil>", tt.expectedErr)
+			} else if tt.expectedErr.Error() != err.Error() {
+				t.Fatalf("error: expected = %v, got = %v", tt.expectedErr, err)
 			}
-		} else if err == nil {
-			t.Fatalf("error: expected = %v, got = <nil>", tt.expectedErr)
-		} else if tt.expectedErr.Error() != err.Error() {
-			t.Fatalf("error: expected = %v, got = %v", tt.expectedErr, err)
-		}
+		})
 	}
 }
 
@@ -209,19 +212,27 @@ func TestParseObjectRetention(t *testing.T) {
 			expectedErr: nil,
 			expectErr:   false,
 		},
+		{
+			value:       `<?xml version="1.0" encoding="UTF-8"?><Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Mode>GOVERNANCE</Mode><RetainUntilDate>2057-01-02T15:04:05.000Z</RetainUntilDate></Retention>`,
+			expectedErr: nil,
+			expectErr:   false,
+		},
 	}
 	for _, tt := range tests {
-		_, err := ParseObjectRetention(strings.NewReader(tt.value))
-		//nolint:gocritic
-		if tt.expectedErr == nil {
-			if err != nil {
-				t.Fatalf("error: expected = <nil>, got = %v", err)
+		tt := tt
+		t.Run("", func(t *testing.T) {
+			_, err := ParseObjectRetention(strings.NewReader(tt.value))
+			//nolint:gocritic
+			if tt.expectedErr == nil {
+				if err != nil {
+					t.Fatalf("error: expected = <nil>, got = %v", err)
+				}
+			} else if err == nil {
+				t.Fatalf("error: expected = %v, got = <nil>", tt.expectedErr)
+			} else if tt.expectedErr.Error() != err.Error() {
+				t.Fatalf("error: expected = %v, got = %v", tt.expectedErr, err)
 			}
-		} else if err == nil {
-			t.Fatalf("error: expected = %v, got = <nil>", tt.expectedErr)
-		} else if tt.expectedErr.Error() != err.Error() {
-			t.Fatalf("error: expected = %v, got = %v", tt.expectedErr, err)
-		}
+		})
 	}
 }
 
@@ -364,6 +375,13 @@ func TestParseObjectLockRetentionHeaders(t *testing.T) {
 			header: http.Header{
 				xhttp.AmzObjectLockMode:            []string{"governance"},
 				xhttp.AmzObjectLockRetainUntilDate: []string{"2087-01-02T15:04:05Z"},
+			},
+			expectedErr: nil,
+		},
+		{
+			header: http.Header{
+				xhttp.AmzObjectLockMode:            []string{"governance"},
+				xhttp.AmzObjectLockRetainUntilDate: []string{"2087-01-02T15:04:05.000Z"},
 			},
 			expectedErr: nil,
 		},
@@ -588,7 +606,7 @@ func TestFilterObjectLockMetadata(t *testing.T) {
 
 	for i, tt := range tests {
 		o := FilterObjectLockMetadata(tt.metadata, tt.filterRetention, tt.filterLegalHold)
-		if !reflect.DeepEqual(o, tt.metadata) {
+		if !reflect.DeepEqual(o, tt.expected) {
 			t.Fatalf("Case %d expected %v, got %v", i, tt.metadata, o)
 		}
 	}

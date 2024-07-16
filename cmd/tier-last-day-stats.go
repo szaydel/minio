@@ -20,8 +20,10 @@ package cmd
 import (
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 )
+
+//go:generate msgp -file=$GOFILE -unexported
 
 type lastDayTierStats struct {
 	Bins      [24]tierStats
@@ -38,6 +40,10 @@ func (l *lastDayTierStats) addStats(ts tierStats) {
 
 // forwardTo moves time to t, clearing entries between last update and t.
 func (l *lastDayTierStats) forwardTo(t time.Time) {
+	if t.IsZero() {
+		t = time.Now()
+	}
+
 	since := t.Sub(l.UpdatedAt).Hours()
 	// within the hour since l.UpdatedAt
 	if since < 1 {
@@ -45,15 +51,17 @@ func (l *lastDayTierStats) forwardTo(t time.Time) {
 	}
 
 	idx, lastIdx := t.Hour(), l.UpdatedAt.Hour()
-	l.UpdatedAt = t
+
+	l.UpdatedAt = t // update to the latest time index
 
 	if since >= 24 {
 		l.Bins = [24]tierStats{}
 		return
 	}
 
-	for ; lastIdx != idx; lastIdx++ {
-		l.Bins[(lastIdx+1)%24] = tierStats{}
+	for lastIdx != idx {
+		lastIdx = (lastIdx + 1) % 24
+		l.Bins[lastIdx] = tierStats{}
 	}
 }
 
@@ -95,9 +103,8 @@ func (l DailyAllTierStats) merge(m DailyAllTierStats) {
 
 func (l DailyAllTierStats) addToTierInfo(tierInfos []madmin.TierInfo) []madmin.TierInfo {
 	for i := range tierInfos {
-		var lst lastDayTierStats
-		var ok bool
-		if lst, ok = l[tierInfos[i].Name]; !ok {
+		lst, ok := l[tierInfos[i].Name]
+		if !ok {
 			continue
 		}
 		for hr, st := range lst.Bins {

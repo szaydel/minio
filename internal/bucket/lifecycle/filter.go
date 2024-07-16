@@ -20,7 +20,6 @@ package lifecycle
 import (
 	"encoding/xml"
 	"io"
-	"log"
 
 	"github.com/minio/minio-go/v7/pkg/tags"
 )
@@ -33,6 +32,9 @@ type Filter struct {
 	set     bool
 
 	Prefix Prefix
+
+	ObjectSizeGreaterThan int64 `xml:"ObjectSizeGreaterThan,omitempty"`
+	ObjectSizeLessThan    int64 `xml:"ObjectSizeLessThan,omitempty"`
 
 	And    And
 	andSet bool
@@ -65,6 +67,17 @@ func (f Filter) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 		if err := e.EncodeElement(f.Prefix, xml.StartElement{Name: xml.Name{Local: "Prefix"}}); err != nil {
 			return err
 		}
+
+		if f.ObjectSizeLessThan > 0 {
+			if err := e.EncodeElement(f.ObjectSizeLessThan, xml.StartElement{Name: xml.Name{Local: "ObjectSizeLessThan"}}); err != nil {
+				return err
+			}
+		}
+		if f.ObjectSizeGreaterThan > 0 {
+			if err := e.EncodeElement(f.ObjectSizeGreaterThan, xml.StartElement{Name: xml.Name{Local: "ObjectSizeGreaterThan"}}); err != nil {
+				return err
+			}
+		}
 	}
 
 	return e.EncodeToken(xml.EndElement{Name: start.Name})
@@ -83,8 +96,7 @@ func (f *Filter) UnmarshalXML(d *xml.Decoder, start xml.StartElement) (err error
 			return err
 		}
 
-		switch se := t.(type) {
-		case xml.StartElement:
+		if se, ok := t.(xml.StartElement); ok {
 			switch se.Name.Local {
 			case "Prefix":
 				var p Prefix
@@ -106,6 +118,18 @@ func (f *Filter) UnmarshalXML(d *xml.Decoder, start xml.StartElement) (err error
 				}
 				f.Tag = tag
 				f.tagSet = true
+			case "ObjectSizeLessThan":
+				var sz int64
+				if err = d.DecodeElement(&sz, &se); err != nil {
+					return err
+				}
+				f.ObjectSizeLessThan = sz
+			case "ObjectSizeGreaterThan":
+				var sz int64
+				if err = d.DecodeElement(&sz, &se); err != nil {
+					return err
+				}
+				f.ObjectSizeGreaterThan = sz
 			default:
 				return errUnknownXMLTag
 			}
@@ -124,32 +148,64 @@ func (f Filter) Validate() error {
 	if f.IsEmpty() {
 		return errXMLNotWellFormed
 	}
-	// A Filter must have exactly one of Prefix, Tag, or And specified.
+	// A Filter must have exactly one of Prefix, Tag,
+	// ObjectSize{LessThan,GreaterThan} or And specified.
+	type predType uint8
+	const (
+		nonePred predType = iota
+		prefixPred
+		andPred
+		tagPred
+		sizeLtPred
+		sizeGtPred
+	)
+	var predCount int
+	var pType predType
 	if !f.And.isEmpty() {
-		if f.Prefix.set {
-			return errInvalidFilter
-		}
-		if !f.Tag.IsEmpty() {
-			return errInvalidFilter
-		}
-		if err := f.And.Validate(); err != nil {
-			return err
-		}
+		pType = andPred
+		predCount++
 	}
 	if f.Prefix.set {
-		if !f.Tag.IsEmpty() {
-			return errInvalidFilter
-		}
+		pType = prefixPred
+		predCount++
 	}
 	if !f.Tag.IsEmpty() {
-		if f.Prefix.set {
-			return errInvalidFilter
+		pType = tagPred
+		predCount++
+	}
+	if f.ObjectSizeGreaterThan != 0 {
+		pType = sizeGtPred
+		predCount++
+	}
+	if f.ObjectSizeLessThan != 0 {
+		pType = sizeLtPred
+		predCount++
+	}
+	// Note: S3 supports empty <Filter></Filter>, so predCount == 0 is
+	// valid.
+	if predCount > 1 {
+		return errInvalidFilter
+	}
+
+	var err error
+	switch pType {
+	case nonePred:
+	// S3 supports empty <Filter></Filter>
+	case prefixPred:
+	case andPred:
+		err = f.And.Validate()
+	case tagPred:
+		err = f.Tag.Validate()
+	case sizeLtPred:
+		if f.ObjectSizeLessThan < 0 {
+			err = errXMLNotWellFormed
 		}
-		if err := f.Tag.Validate(); err != nil {
-			return err
+	case sizeGtPred:
+		if f.ObjectSizeGreaterThan < 0 {
+			err = errXMLNotWellFormed
 		}
 	}
-	return nil
+	return err
 }
 
 // TestTags tests if the object tags satisfy the Filter tags requirement,
@@ -172,24 +228,39 @@ func (f Filter) TestTags(userTags string) bool {
 
 	parsedTags, err := tags.ParseObjectTags(userTags)
 	if err != nil {
-		log.Printf("Unexpected object tag found: `%s`\n", userTags)
 		return false
 	}
 	tagsMap := parsedTags.ToMap()
 
-	// This filter has tags configured but this object
-	// does not have any tag, skip this object
-	if len(tagsMap) == 0 {
+	// Not enough tags on object to satisfy the rule filter's tags
+	if len(tagsMap) < len(f.cachedTags) {
 		return false
 	}
 
-	// Both filter and object have tags, find a match,
-	// skip this object otherwise
+	var mismatch bool
 	for k, cv := range f.cachedTags {
 		v, ok := tagsMap[k]
-		if ok && v == cv {
-			return true
+		if !ok || v != cv {
+			mismatch = true
+			break
 		}
 	}
-	return false
+	return !mismatch
+}
+
+// BySize returns true if sz satisfies one of ObjectSizeGreaterThan,
+// ObjectSizeLessThan predicates or a combination of them via And.
+func (f Filter) BySize(sz int64) bool {
+	if f.ObjectSizeGreaterThan > 0 &&
+		sz <= f.ObjectSizeGreaterThan {
+		return false
+	}
+	if f.ObjectSizeLessThan > 0 &&
+		sz >= f.ObjectSizeLessThan {
+		return false
+	}
+	if !f.And.isEmpty() {
+		return f.And.BySize(sz)
+	}
+	return true
 }

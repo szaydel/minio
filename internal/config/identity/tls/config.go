@@ -23,7 +23,7 @@ import (
 
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config"
-	"github.com/minio/pkg/env"
+	"github.com/minio/pkg/v3/env"
 )
 
 const (
@@ -106,7 +106,7 @@ const (
 	skipVerify = "skip_verify"
 )
 
-// DefaultKVS is the the default K/V config system for
+// DefaultKVS is the default K/V config system for
 // the STS TLS API.
 var DefaultKVS = config.KVS{
 	config.KV{

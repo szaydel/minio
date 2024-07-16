@@ -17,6 +17,8 @@
 
 package cmd
 
+//go:generate msgp -file=$GOFILE -unexported
+
 import (
 	"context"
 	"fmt"
@@ -34,14 +36,11 @@ type lockRequesterInfo struct {
 	UID             string    // UID to uniquely identify request of client.
 	Timestamp       time.Time // Timestamp set at the time of initialization.
 	TimeLastRefresh time.Time // Timestamp for last lock refresh.
-	Source          string    // Contains line, function and filename reqesting the lock.
+	Source          string    // Contains line, function and filename requesting the lock.
 	Group           bool      // indicates if it was a group lock.
-	// Owner represents the UUID of the owner who originally requested the lock
-	// useful in expiry.
-	Owner string
-	// Quorum represents the quorum required for this lock to be active.
-	Quorum int
-	idx    int
+	Owner           string    // Owner represents the UUID of the owner who originally requested the lock.
+	Quorum          int       // Quorum represents the quorum required for this lock to be active.
+	idx             int       `msg:"-"` // index of the lock in the lockMap.
 }
 
 // isWriteLock returns whether the lock is a write or read lock.
@@ -50,6 +49,8 @@ func isWriteLock(lri []lockRequesterInfo) bool {
 }
 
 // localLocker implements Dsync.NetLocker
+//
+//msgp:ignore localLocker
 type localLocker struct {
 	mutex   sync.Mutex
 	lockMap map[string][]lockRequesterInfo
@@ -58,15 +59,6 @@ type localLocker struct {
 
 func (l *localLocker) String() string {
 	return globalEndpoints.Localhost()
-}
-
-func (l *localLocker) canTakeUnlock(resources ...string) bool {
-	for _, resource := range resources {
-		if !isWriteLock(l.lockMap[resource]) {
-			return false
-		}
-	}
-	return true
 }
 
 func (l *localLocker) canTakeLock(resources ...string) bool {
@@ -129,12 +121,12 @@ func (l *localLocker) Unlock(_ context.Context, args dsync.LockArgs) (reply bool
 	err = nil
 
 	for _, resource := range args.Resources {
-		if !l.canTakeUnlock(resource) {
+		lri, ok := l.lockMap[resource]
+		if ok && !isWriteLock(lri) {
 			// Unless it is a write lock reject it.
 			err = fmt.Errorf("unlock attempted on a read locked entity: %s", resource)
 			continue
 		}
-		lri, ok := l.lockMap[resource]
 		if ok {
 			reply = l.removeEntry(resource, args, &lri) || reply
 		}
@@ -168,7 +160,7 @@ func (l *localLocker) removeEntry(name string, args dsync.LockArgs, lri *[]lockR
 }
 
 func (l *localLocker) RLock(ctx context.Context, args dsync.LockArgs) (reply bool, err error) {
-	if len(args.Resources) > 1 {
+	if len(args.Resources) != 1 {
 		return false, fmt.Errorf("internal error: localLocker.RLock called with more than one resource")
 	}
 
@@ -222,12 +214,43 @@ func (l *localLocker) RUnlock(_ context.Context, args dsync.LockArgs) (reply boo
 	return reply, nil
 }
 
-func (l *localLocker) DupLockMap() map[string][]lockRequesterInfo {
+type lockStats struct {
+	Total  int
+	Writes int
+	Reads  int
+}
+
+func (l *localLocker) stats() lockStats {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	st := lockStats{Total: len(l.lockMap)}
+	for _, v := range l.lockMap {
+		if len(v) == 0 {
+			continue
+		}
+		entry := v[0]
+		if entry.Writer {
+			st.Writes++
+		} else {
+			st.Reads += len(v)
+		}
+	}
+	return st
+}
+
+type localLockMap map[string][]lockRequesterInfo
+
+func (l *localLocker) DupLockMap() localLockMap {
 	l.mutex.Lock()
 	defer l.mutex.Unlock()
 
 	lockCopy := make(map[string][]lockRequesterInfo, len(l.lockMap))
 	for k, v := range l.lockMap {
+		if len(v) == 0 {
+			delete(l.lockMap, k)
+			continue
+		}
 		lockCopy[k] = append(make([]lockRequesterInfo, 0, len(v)), v...)
 	}
 	return lockCopy

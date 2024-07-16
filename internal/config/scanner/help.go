@@ -27,22 +27,22 @@ var (
 	// Help provides help for config values
 	Help = config.HelpKVS{
 		config.HelpKV{
-			Key:         Delay,
-			Description: `scanner delay multiplier` + defaultHelpPostfix(Delay),
+			Key:         Speed,
+			Description: `customize scanner speed (default|slowest|slow|fast|fastest)` + defaultHelpPostfix(Speed),
 			Optional:    true,
-			Type:        "float",
+			Type:        "string",
 		},
 		config.HelpKV{
-			Key:         MaxWait,
-			Description: `maximum wait time between operations` + defaultHelpPostfix(MaxWait),
+			Key:         ExcessVersions,
+			Description: `alert per object beyond this many versions` + defaultHelpPostfix(ExcessVersions),
 			Optional:    true,
-			Type:        "duration",
+			Type:        "int",
 		},
 		config.HelpKV{
-			Key:         Cycle,
-			Description: `time duration between scanner cycles` + defaultHelpPostfix(Cycle),
+			Key:         ExcessFolders,
+			Description: `alert beyond this many sub-folders per folder in an erasure set` + defaultHelpPostfix(ExcessFolders),
 			Optional:    true,
-			Type:        "duration",
+			Type:        "int",
 		},
 	}
 )

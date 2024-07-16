@@ -20,11 +20,18 @@ package subnet
 import (
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
 
 	"github.com/minio/minio/internal/config"
-	"github.com/minio/pkg/env"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/pkg/v3/env"
+	xnet "github.com/minio/pkg/v3/net"
+)
+
+const (
+	baseURL    = "https://subnet.min.io"
+	baseURLDev = "http://localhost:9000"
 )
 
 // DefaultKVS - default KV config for subnet settings
@@ -49,13 +56,62 @@ type Config struct {
 	License string `json:"license"`
 
 	// The subnet api key
-	APIKey string `json:"api_key"`
+	APIKey string `json:"apiKey"`
 
 	// The HTTP(S) proxy URL to use for connecting to SUBNET
-	ProxyURL *xnet.URL `json:"proxy_url"`
+	Proxy string `json:"proxy"`
 
 	// Transport configured with proxy_url if set optionally.
-	transport *http.Transport
+	transport http.RoundTripper
+
+	// The subnet base URL
+	BaseURL string
+}
+
+var configLock sync.RWMutex
+
+// Registered indicates if cluster is registered or not
+func (c *Config) Registered() bool {
+	configLock.RLock()
+	defer configLock.RUnlock()
+
+	return len(c.APIKey) > 0
+}
+
+// ApplyEnv - applies the current subnet config to Console UI specific environment variables.
+func (c *Config) ApplyEnv() {
+	configLock.RLock()
+	defer configLock.RUnlock()
+
+	if c.License != "" {
+		os.Setenv("CONSOLE_SUBNET_LICENSE", c.License)
+	}
+	if c.APIKey != "" {
+		os.Setenv("CONSOLE_SUBNET_API_KEY", c.APIKey)
+	}
+	if c.Proxy != "" {
+		os.Setenv("CONSOLE_SUBNET_PROXY", c.Proxy)
+	}
+	os.Setenv("CONSOLE_SUBNET_URL", c.BaseURL)
+}
+
+// Update - in-place update with new license and registration information.
+func (c *Config) Update(ncfg Config, isDevEnv bool) {
+	configLock.Lock()
+	defer configLock.Unlock()
+
+	c.License = ncfg.License
+	c.APIKey = ncfg.APIKey
+	c.Proxy = ncfg.Proxy
+	c.transport = ncfg.transport
+	c.BaseURL = baseURL
+
+	if isDevEnv {
+		c.BaseURL = os.Getenv("_MINIO_SUBNET_URL")
+		if c.BaseURL == "" {
+			c.BaseURL = baseURLDev
+		}
+	}
 }
 
 // LookupConfig - lookup config and override with valid environment settings if any.
@@ -64,9 +120,10 @@ func LookupConfig(kvs config.KVS, transport http.RoundTripper) (cfg Config, err 
 		return cfg, err
 	}
 
+	var proxyURL *xnet.URL
 	proxy := env.Get(config.EnvMinIOSubnetProxy, kvs.Get(config.Proxy))
 	if len(proxy) > 0 {
-		cfg.ProxyURL, err = xnet.ParseHTTPURL(proxy)
+		proxyURL, err = xnet.ParseHTTPURL(proxy)
 		if err != nil {
 			return cfg, err
 		}
@@ -75,6 +132,7 @@ func LookupConfig(kvs config.KVS, transport http.RoundTripper) (cfg Config, err 
 
 	cfg.License = strings.TrimSpace(env.Get(config.EnvMinIOSubnetLicense, kvs.Get(config.License)))
 	cfg.APIKey = strings.TrimSpace(env.Get(config.EnvMinIOSubnetAPIKey, kvs.Get(config.APIKey)))
+	cfg.Proxy = proxy
 
 	if transport == nil {
 		// when transport is nil, it means we are just validating the
@@ -83,11 +141,13 @@ func LookupConfig(kvs config.KVS, transport http.RoundTripper) (cfg Config, err 
 	}
 
 	// Make sure to clone the transport before editing the ProxyURL
-	ctransport := transport.(*http.Transport).Clone()
-	if cfg.ProxyURL != nil {
-		ctransport.Proxy = http.ProxyURL((*url.URL)(cfg.ProxyURL))
+	if proxyURL != nil {
+		ctransport := transport.(*http.Transport).Clone()
+		ctransport.Proxy = http.ProxyURL((*url.URL)(proxyURL))
+		cfg.transport = ctransport
+	} else {
+		cfg.transport = transport
 	}
-	cfg.transport = ctransport
 
 	return cfg, nil
 }
