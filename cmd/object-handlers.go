@@ -501,8 +501,8 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 			reader *GetObjectReader
 			perr   error
 		)
-		// avoid proxying if version is a delete marker
-		if !isErrObjectNameInvalid(err) && !isErrMethodNotAllowed(err) && !(gr != nil && gr.ObjInfo.DeleteMarker) {
+
+		if (isErrObjectNotFound(err) || isErrVersionNotFound(err) || isErrReadQuorum(err)) && !(gr != nil && gr.ObjInfo.DeleteMarker) {
 			proxytgts := getProxyTargets(ctx, bucket, object, opts)
 			if !proxytgts.Empty() {
 				globalReplicationStats.incProxy(bucket, getObjectAPI, false)
@@ -762,21 +762,14 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 	if _, ok := opts.ObjectAttributes[xhttp.Checksum]; ok {
 		chkSums := objInfo.decryptChecksums(0, r.Header)
 		// AWS does not appear to append part number on this API call.
-		switch {
-		case chkSums["CRC32"] != "":
-			OA.Checksum = new(objectAttributesChecksum)
-			OA.Checksum.ChecksumCRC32 = strings.Split(chkSums["CRC32"], "-")[0]
-		case chkSums["CRC32C"] != "":
-			OA.Checksum = new(objectAttributesChecksum)
-			OA.Checksum.ChecksumCRC32C = strings.Split(chkSums["CRC32C"], "-")[0]
-		case chkSums["SHA256"] != "":
-			OA.Checksum = new(objectAttributesChecksum)
-			OA.Checksum.ChecksumSHA1 = strings.Split(chkSums["SHA1"], "-")[0]
-		case chkSums["SHA1"] != "":
-			OA.Checksum = new(objectAttributesChecksum)
-			OA.Checksum.ChecksumSHA256 = strings.Split(chkSums["SHA256"], "-")[0]
+		if len(chkSums) > 0 {
+			OA.Checksum = &objectAttributesChecksum{
+				ChecksumCRC32:  strings.Split(chkSums["CRC32"], "-")[0],
+				ChecksumCRC32C: strings.Split(chkSums["CRC32C"], "-")[0],
+				ChecksumSHA1:   strings.Split(chkSums["SHA1"], "-")[0],
+				ChecksumSHA256: strings.Split(chkSums["SHA256"], "-")[0],
+			}
 		}
-
 	}
 
 	if _, ok := opts.ObjectAttributes[xhttp.ETag]; ok {
@@ -1028,7 +1021,7 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 
 	objInfo, err := getObjectInfo(ctx, bucket, object, opts)
 	var proxy proxyResult
-	if err != nil && !objInfo.DeleteMarker && !isErrMethodNotAllowed(err) && !isErrObjectNameInvalid(err) {
+	if err != nil && !objInfo.DeleteMarker && (isErrObjectNotFound(err) || isErrVersionNotFound(err) || isErrReadQuorum(err)) {
 		// proxy HEAD to replication target if active-active replication configured on bucket
 		proxytgts := getProxyTargets(ctx, bucket, object, opts)
 		if !proxytgts.Empty() {

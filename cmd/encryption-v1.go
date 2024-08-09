@@ -743,8 +743,9 @@ func (d *DecryptBlocksReader) Read(p []byte) (int, error) {
 // but has an invalid size.
 func (o ObjectInfo) DecryptedSize() (int64, error) {
 	if _, ok := crypto.IsEncrypted(o.UserDefined); !ok {
-		return 0, errors.New("Cannot compute decrypted size of an unencrypted object")
+		return -1, errors.New("Cannot compute decrypted size of an unencrypted object")
 	}
+
 	if !o.isMultipart() {
 		size, err := sio.DecryptedSize(uint64(o.Size))
 		if err != nil {
@@ -757,7 +758,7 @@ func (o ObjectInfo) DecryptedSize() (int64, error) {
 	for _, part := range o.Parts {
 		partSize, err := sio.DecryptedSize(uint64(part.Size))
 		if err != nil {
-			return 0, errObjectTampered
+			return -1, errObjectTampered
 		}
 		size += int64(partSize)
 	}
@@ -1171,6 +1172,14 @@ func (o *ObjectInfo) decryptChecksums(part int, h http.Header) map[string]string
 	data := o.Checksum
 	if len(data) == 0 {
 		return nil
+	}
+	if part > 0 && !crypto.SSEC.IsEncrypted(o.UserDefined) {
+		// already decrypted in ToObjectInfo for multipart objects
+		for _, pi := range o.Parts {
+			if pi.Number == part {
+				return pi.Checksums
+			}
+		}
 	}
 	if _, encrypted := crypto.IsEncrypted(o.UserDefined); encrypted {
 		decrypted, err := o.metadataDecrypter(h)("object-checksum", data)

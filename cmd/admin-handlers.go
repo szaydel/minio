@@ -848,9 +848,10 @@ func (a adminAPIHandlers) DataUsageInfoHandler(w http.ResponseWriter, r *http.Re
 }
 
 func lriToLockEntry(l lockRequesterInfo, now time.Time, resource, server string) *madmin.LockEntry {
+	t := time.Unix(0, l.Timestamp)
 	entry := &madmin.LockEntry{
-		Timestamp:  l.Timestamp,
-		Elapsed:    now.Sub(l.Timestamp),
+		Timestamp:  t,
+		Elapsed:    now.Sub(t),
 		Resource:   resource,
 		ServerList: []string{server},
 		Source:     l.Source,
@@ -2186,7 +2187,7 @@ func (a adminAPIHandlers) KMSCreateKeyHandler(w http.ResponseWriter, r *http.Req
 	writeSuccessResponseHeadersOnly(w)
 }
 
-// KMSKeyStatusHandler - GET /minio/admin/v3/kms/status
+// KMSStatusHandler - GET /minio/admin/v3/kms/status
 func (a adminAPIHandlers) KMSStatusHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 

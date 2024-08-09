@@ -45,6 +45,9 @@ const (
 
 	// RoutePath is the remote path to connect to.
 	RoutePath = "/minio/grid/" + apiVersion
+
+	// RouteLockPath is the remote lock path to connect to.
+	RouteLockPath = "/minio/grid/lock/" + apiVersion
 )
 
 // Manager will contain all the connections to the grid.
@@ -65,6 +68,9 @@ type Manager struct {
 
 	// authToken is a function that will validate a token.
 	authToken ValidateTokenFn
+
+	// routePath indicates the dial route path
+	routePath string
 }
 
 // ManagerOptions are options for creating a new grid manager.
@@ -74,6 +80,7 @@ type ManagerOptions struct {
 	Incoming     func(n int64) // Record incoming bytes.
 	Outgoing     func(n int64) // Record outgoing bytes.
 	BlockConnect chan struct{} // If set, incoming and outgoing connections will be blocked until closed.
+	RoutePath    string
 	TraceTo      *pubsub.PubSub[madmin.TraceInfo, madmin.TraceType]
 	Dialer       ConnDialer
 	// Sign a token for the given audience.
@@ -99,6 +106,7 @@ func NewManager(ctx context.Context, o ManagerOptions) (*Manager, error) {
 		targets:   make(map[string]*Connection, len(o.Hosts)),
 		local:     o.Local,
 		authToken: o.AuthToken,
+		routePath: o.RoutePath,
 	}
 	m.handlers.init()
 	if ctx == nil {
@@ -137,7 +145,7 @@ func NewManager(ctx context.Context, o ManagerOptions) (*Manager, error) {
 
 // AddToMux will add the grid manager to the given mux.
 func (m *Manager) AddToMux(router *mux.Router, authReq func(r *http.Request) error) {
-	router.Handle(RoutePath, m.Handler(authReq))
+	router.Handle(m.routePath, m.Handler(authReq))
 }
 
 // Handler returns a handler that can be used to serve grid requests.
@@ -245,7 +253,7 @@ func (m *Manager) IncomingConn(ctx context.Context, conn net.Conn) {
 		writeErr(fmt.Errorf("time difference too large between servers: %v", time.Since(cReq.Time).Abs()))
 		return
 	}
-	if err := m.authToken(cReq.Token, cReq.audience()); err != nil {
+	if err := m.authToken(cReq.Token); err != nil {
 		writeErr(fmt.Errorf("auth token: %w", err))
 		return
 	}
@@ -257,10 +265,10 @@ func (m *Manager) IncomingConn(ctx context.Context, conn net.Conn) {
 }
 
 // AuthFn should provide an authentication string for the given aud.
-type AuthFn func(aud string) string
+type AuthFn func() string
 
 // ValidateAuthFn should check authentication for the given aud.
-type ValidateAuthFn func(auth, aud string) string
+type ValidateAuthFn func(auth string) string
 
 // Connection will return the connection for the specified host.
 // If the host does not exist nil will be returned.

@@ -168,7 +168,7 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 
 	if !globalIsDistErasure {
 		globalLocalDrivesMu.Lock()
-		globalLocalDrives = localDrives
+		globalLocalDrivesMap = make(map[string]StorageAPI, len(localDrives))
 		for _, drive := range localDrives {
 			globalLocalDrivesMap[drive.Endpoint().String()] = drive
 		}
@@ -1087,6 +1087,14 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 		return ObjectInfo{}, err
 	}
 
+	if opts.DataMovement && idx == opts.SrcPoolIdx {
+		return ObjectInfo{}, DataMovementOverwriteErr{
+			Bucket:    bucket,
+			Object:    object,
+			VersionID: opts.VersionID,
+			Err:       errDataMovementSrcDstPoolSame,
+		}
+	}
 	// Overwrite the object at the right pool
 	return z.serverPools[idx].PutObject(ctx, bucket, object, data, opts)
 }
@@ -1526,14 +1534,12 @@ func (z *erasureServerPools) listObjectsGeneric(ctx context.Context, bucket, pre
 			loi.NextMarker = last.Name
 		}
 
-		if merged.lastSkippedEntry != "" {
-			if merged.lastSkippedEntry > loi.NextMarker {
-				// An object hidden by ILM was found during listing. Since the number of entries
-				// fetched from drives is limited, set IsTruncated to true to ask the s3 client
-				// to continue listing if it wishes in order to find if there is more objects.
-				loi.IsTruncated = true
-				loi.NextMarker = merged.lastSkippedEntry
-			}
+		if loi.IsTruncated && merged.lastSkippedEntry > loi.NextMarker {
+			// An object hidden by ILM was found during a truncated listing. Since the number of entries
+			// fetched from drives is limited by max-keys, we should use the last ILM filtered entry
+			// as a continuation token if it is lexially higher than the last visible object so that the
+			// next call of WalkDir() with the max-keys can reach new objects not seen previously.
+			loi.NextMarker = merged.lastSkippedEntry
 		}
 
 		if loi.NextMarker != "" {
@@ -1752,6 +1758,15 @@ func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, obj
 	idx, err := z.getPoolIdx(ctx, bucket, object, -1)
 	if err != nil {
 		return nil, err
+	}
+
+	if opts.DataMovement && idx == opts.SrcPoolIdx {
+		return nil, DataMovementOverwriteErr{
+			Bucket:    bucket,
+			Object:    object,
+			VersionID: opts.VersionID,
+			Err:       errDataMovementSrcDstPoolSame,
+		}
 	}
 
 	return z.serverPools[idx].NewMultipartUpload(ctx, bucket, object, opts)
